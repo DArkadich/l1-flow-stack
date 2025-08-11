@@ -59,14 +59,15 @@ class Cfg(BaseModel):
     tg_token: str = Field(..., alias="TG_BOT_TOKEN")
     tg_chat: str = Field(..., alias="TG_CHAT_ID")
 
-    # Хук динамического порога funding + репорты по времени суток
+    # Динамический порог + дневные отчёты
     dyn_hook: bool = Field(False, alias="L1_DYN_HOOK_ENABLE")
     fr_lower: float = Field(0.00005, alias="L1_DYN_HOOK_FR_LOWER")
     fr_upper: float = Field(0.00020, alias="L1_DYN_HOOK_FR_UPPER")
-    tz_offset_min: int = Field(0, alias="L1_TZ_OFFSET_MINUTES")  # смещение от UTC в минутах (например, МСК = +180)
-    day_start_h: int = Field(9, alias="L1_DAY_START_HOUR")       # начало дневных часов (локальных)
-    day_end_h: int = Field(21, alias="L1_DAY_END_HOUR")          # конец дневных часов (локальных, невключительно)
+    tz_offset_min: int = Field(0, alias="L1_TZ_OFFSET_MINUTES")  # смещение от UTC в минутах (МСК=180)
+    day_start_h: int = Field(9, alias="L1_DAY_START_HOUR")       # [start, end) локальные часы
+    day_end_h: int = Field(21, alias="L1_DAY_END_HOUR")
     report_top_n: int = Field(4, alias="L1_REPORT_TOP_N")
+    report_min_fr: float = Field(0.0, alias="L1_REPORT_MIN_FR")  # фильтр в отчёте
 
     @field_validator("symbols", mode="before")
     @classmethod
@@ -92,26 +93,19 @@ ex = ccxt.bybit({
     "options": {"defaultType": "unified"},
 })
 ex.load_markets()
-ex.verbose = TRACE_API  # печатать сырые запросы/ответы ccxt при отладке
+ex.verbose = TRACE_API
 
 
 def to_perp_symbol(sym_spot: str) -> str:
-    """
-    Превращает 'BTC/USDT' -> 'BTC/USDT:USDT' (линейный перп).
-    Если на бирже символ называется иначе, пытается найти swap-рынок по базе/квоте.
-    """
+    """ 'BTC/USDT' -> 'BTC/USDT:USDT' (linear swap). Если не найдено — пытаемся поискать по базе/квоте. """
     guess = f"{sym_spot}:USDT"
     if guess in ex.markets and ex.markets[guess].get("swap"):
         return guess
-
     base, quote = sym_spot.split("/")
     for m in ex.markets.values():
-        if not m.get("swap"):
-            continue
-        if m.get("base") == base and m.get("quote") in (quote, "USDT"):
+        if m.get("swap") and m.get("base") == base and m.get("quote") in (quote, "USDT"):
             return m["symbol"]
-
-    dlog(f"[to_perp_symbol] не найден swap для {sym_spot}, fallback на спот")
+    dlog(f"[to_perp_symbol] swap не найден для {sym_spot}, fallback на спот")
     return sym_spot
 
 # ---------- SQLite ----------
@@ -144,7 +138,8 @@ def sset(con, k, v):
 def fetch_balance_safe() -> Dict[str, Dict[str, float]]:
     try:
         bal = ex.fetch_balance(params={"type": "unified"}) or {}
-        if TRACE_API: dlog(f"[fetch_balance_safe] raw={bal}")
+        if TRACE_API:
+            dlog(f"[fetch_balance_safe] raw={bal}")
         total = {k: sfloat(v, 0.0) for k, v in (bal.get("total") or {}).items()}
         free = {k: sfloat(v, 0.0) for k, v in (bal.get("free") or {}).items()}
         used = {k: sfloat(v, 0.0) for k, v in (bal.get("used") or {}).items()}
@@ -165,10 +160,11 @@ def free_equity() -> float:
 
 
 def mark(sym: str) -> float:
-    """Пытаемся взять last; если None — mid(bid,ask); если и это None — mid по книге"""
+    """ Берём last; если None — mid(bid,ask); иначе mid по книге. """
     try:
         t = ex.fetch_ticker(sym) or {}
-        if TRACE_API: dlog(f"[mark] {sym} ticker={t}")
+        if TRACE_API:
+            dlog(f"[mark] {sym} ticker={t}")
         last = sfloat(t.get("last"), 0.0)
         if last > 0:
             return last
@@ -177,7 +173,6 @@ def mark(sym: str) -> float:
         if bid > 0 and ask > 0:
             return (bid + ask) / 2.0
         ob = ex.fetch_order_book(sym)
-        if TRACE_API: dlog(f"[mark] {sym} ob bests: bid={ob.get('bids',[[0]])[0][0] if ob.get('bids') else 0}, ask={ob.get('asks',[[0]])[0][0] if ob.get('asks') else 0}")
         best_bid = sfloat(ob.get("bids", [[0]])[0][0], 0.0) if ob.get("bids") else 0.0
         best_ask = sfloat(ob.get("asks", [[0]])[0][0], 0.0) if ob.get("asks") else 0.0
         if best_bid > 0 and best_ask > 0:
@@ -189,14 +184,12 @@ def mark(sym: str) -> float:
 
 
 def funding_8h(sym: str) -> float:
-    """
-    Возвращает ожидаемую ставку финансирования за 8ч для перп-контракта.
-    Для Bybit используем ccxt.fetchFundingRate() по перп-символу (linear swap).
-    """
+    """ Ожидаемая ставка финансирования за 8ч (Bybit linear swap через ccxt.fetchFundingRate). """
     try:
         perp = to_perp_symbol(sym)
         fr = ex.fetchFundingRate(perp, params={"category": "linear"}) or {}
-        if TRACE_API: dlog(f"[funding_8h] sym={sym} perp={perp} raw={fr}")
+        if TRACE_API:
+            dlog(f"[funding_8h] sym={sym} perp={perp} raw={fr}")
         rate = sfloat(fr.get("fundingRate"), 0.0)
         if rate == 0.0:
             info = fr.get("info") or {}
@@ -238,7 +231,8 @@ def positions(sym: str) -> Dict[str, float]:
         mkt = ex.market(perp)
         pos = ex.private_get_v5_position_list({"category": "linear", "symbol": mkt["id"]})
         lst = ((pos or {}).get("result") or {}).get("list") or []
-        if TRACE_API: dlog(f"[positions] sym={sym} perp={perp} raw={pos}")
+        if TRACE_API:
+            dlog(f"[positions] sym={sym} perp={perp} raw={pos}")
         for p in lst:
             side = (p.get("side") or "").lower()
             sz = sfloat(p.get("size"), 0.0)
@@ -257,7 +251,8 @@ def order_spot_buy(sym: str, quote_usdt: float):
         raise RuntimeError(f"mark price unavailable for {sym}")
     base = round((quote_usdt / px) * 0.998, 6)  # запас на комиссии
     o = ex.create_order(sym, type="market", side="buy", amount=base)
-    if TRACE_API: dlog(f"[order_spot_buy] sym={sym} base={base} quote={quote_usdt} resp={o}")
+    if TRACE_API:
+        dlog(f"[order_spot_buy] sym={sym} base={base} quote={quote_usdt} resp={o}")
     return base, o
 
 
@@ -265,7 +260,8 @@ def order_perp_sell(sym: str, base: float):
     set_leverage(sym, cfg.lev)
     perp = to_perp_symbol(sym)
     o = ex.create_order(perp, type="market", side="sell", amount=base, params={"reduceOnly": False})
-    if TRACE_API: dlog(f"[order_perp_sell] perp={perp} base={base} resp={o}")
+    if TRACE_API:
+        dlog(f"[order_perp_sell] perp={perp} base={base} resp={o}")
     return o
 
 
@@ -277,36 +273,66 @@ def order_close_pair(sym: str):
             o1 = ex.create_order(perp, type="market",
                                  side=("buy" if pos["perp"] < 0 else "sell"),
                                  amount=abs(pos["perp"]), params={"reduceOnly": True})
-            if TRACE_API: dlog(f"[order_close_pair] close perp={perp} qty={abs(pos['perp'])} resp={o1}")
+            if TRACE_API:
+                dlog(f"[order_close_pair] close perp={perp} qty={abs(pos['perp'])} resp={o1}")
         if pos["spot"] > 1e-6:
             o2 = ex.create_order(sym, type="market", side="sell", amount=pos["spot"])
-            if TRACE_API: dlog(f"[order_close_pair] sell spot sym={sym} qty={pos['spot']} resp={o2}")
+            if TRACE_API:
+                dlog(f"[order_close_pair] sell spot sym={sym} qty={pos['spot']} resp={o2}")
     except Exception as e:
         print("order_close_pair error:", e)
 
-# ---------- Время суток и динамический порог ----------
+# ---------- Время суток, динамический порог, отчёты ----------
+
+def local_datetime() -> dt.datetime:
+    return now() + dt.timedelta(minutes=cfg.tz_offset_min)
 
 def local_hour_24() -> int:
-    """Текущий локальный час (0-23) с учётом cfg.tz_offset_min относительно UTC."""
-    return int(((now() + dt.timedelta(minutes=cfg.tz_offset_min)).hour) % 24)
+    return int(local_datetime().hour % 24)
 
 def is_daytime() -> bool:
     h = local_hour_24()
     return cfg.day_start_h <= h < cfg.day_end_h
 
+def minutes_to_next_funding_window() -> int:
+    """ Funding выплата на 00:00, 08:00, 16:00 UTC. Считаем минуты до ближайшего окна. """
+    t = now()
+    windows = [0, 8, 16]
+    # следующий целый час UTC среди окон
+    next_hour = None
+    for i in range(24):
+        cand = (t + dt.timedelta(hours=i)).replace(minute=0, second=0, microsecond=0)
+        if cand.hour in windows and cand > t:
+            next_hour = cand
+            break
+    if next_hour is None:
+        next_hour = (t + dt.timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return max(0, int((next_hour - t).total_seconds() // 60))
+
+
 def current_fr_threshold(fr_values: List[float]) -> float:
-    """Динамический хук: если рынок "плоский" (медиана низкая) — снижаем порог, если горячий — поднимаем.
-    В противном случае — базовый cfg.fr_thr."""
+    """ Динамический порог: используем перцентили p25/p75 для оценки "плоскости" рынка. """
     if not cfg.dyn_hook or not fr_values:
         return cfg.fr_thr
-    med = statistics.median(fr_values)
-    # границы берём из конфигурации
-    low, base, high = cfg.fr_lower, cfg.fr_thr, cfg.fr_upper
-    if med <= (low + base) / 2:
-        return low
-    if med >= (base + high) / 2:
-        return high
-    return base
+    try:
+        qs = statistics.quantiles(fr_values, n=4, method='inclusive')  # [Q1, Q2, Q3]
+        q1, q2, q3 = qs[0], qs[1], qs[2]
+        med = q2
+        low, base, high = cfg.fr_lower, cfg.fr_thr, cfg.fr_upper
+        if med <= q1:
+            return low
+        if med >= q3:
+            return high
+        return base
+    except Exception:
+        # fallback на медиану
+        med = statistics.median(fr_values)
+        low, base, high = cfg.fr_lower, cfg.fr_thr, cfg.fr_upper
+        if med <= (low + base) / 2:
+            return low
+        if med >= (base + high) / 2:
+            return high
+        return base
 
 
 def in_funding_window() -> bool:
@@ -339,13 +365,12 @@ def daily_drawdown_exceeded(con, start_e: float):
 
 def main():
     con = sql_conn()
-    tg("🚀 L1 бот (автокомпаунд, fault-tolerant) запущен.")
+    tg("🚀 L1 бот (автокомпаунд, дневные отчёты, dyn-threshold) запущен.")
     if not sget(con, "L1_base_equity", ""):
         sset(con, "L1_base_equity", cfg.start_base)
     last_equity = total_equity()
 
-    # для часового отчёта по funding
-    last_report_tag = sget(con, "last_report_tag", "")  # формат YYYY-MM-DD_HH локальный
+    last_report_tag = sget(con, "last_report_tag", "")  # YYYY-MM-DD_HH (локально)
 
     while True:
         try:
@@ -371,7 +396,7 @@ def main():
             last_equity = eq
             free = free_equity()
 
-            # ------- считываем FR по всем парам сразу и рассчитываем динамический порог -------
+            # ------- FR по всем парам + dyn threshold -------
             fr_map: Dict[str, float] = {}
             px_map: Dict[str, float] = {}
             for sym in cfg.symbols:
@@ -431,17 +456,23 @@ def main():
 
             # ------- Часовой отчёт по funding только в дневные часы -------
             if is_daytime():
-                tag = (now() + dt.timedelta(minutes=cfg.tz_offset_min)).strftime("%Y-%m-%d_%H")
+                tag = local_datetime().strftime("%Y-%m-%d_%H")
                 if tag != last_report_tag:
                     last_report_tag = tag
                     sset(con, "last_report_tag", last_report_tag)
-                    # топ N по FR
-                    top = sorted(fr_map.items(), key=lambda kv: kv[1], reverse=True)[:max(1, cfg.report_top_n)]
-                    lines = [f"⏰ Дневной отчёт FR (локал.час {local_hour_24():02d}) • dyn_thr={dyn_thr:.5f}"]
+                    mins = minutes_to_next_funding_window()
+                    # фильтр по минимальному FR и сортировка по убыванию
+                    pairs = [(sym, fr) for sym, fr in fr_map.items() if fr >= cfg.report_min_fr]
+                    pairs.sort(key=lambda kv: kv[1], reverse=True)
+                    top = pairs[:max(1, cfg.report_top_n)]
+                    lines = [
+                        f"⏰ Дневной отчёт FR (локал.час {local_hour_24():02d}) • dyn_thr={dyn_thr:.5f} • мин до payout≈{mins}"
+                    ]
                     for sym, frv in top:
                         lines.append(f"• {sym}: {frv:.5f}")
-                    tg("
-".join(lines))
+                    if len(top) == 0:
+                        lines.append(f"• Нет пар ≥ {cfg.report_min_fr:.5f}")
+                    tg("\n".join(lines))
 
             time.sleep(cfg.poll)
 

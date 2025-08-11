@@ -320,6 +320,31 @@ def order_close_pair(sym: str):
 
 # ---------- Время суток, динамический порог, отчёты ----------
 
+def min_quote_required(sym: str) -> float:
+    """Минимально необходимая аллокация в USDT для корректного открытия связки
+    (учёт минимального количества для спота и перпа). Возвращает 0.0 если данных нет.
+    """
+    try:
+        px = mark(sym)
+        if px <= 0:
+            return 0.0
+        # лимиты спота
+        m_spot = ex.market(sym)
+        lim_spot = (m_spot.get("limits") or {}).get("amount") or {}
+        min_spot = sfloat(lim_spot.get("min"), 0.0)
+        # лимиты перпа
+        perp = to_perp_symbol(sym)
+        m_perp = ex.market(perp)
+        lim_perp = (m_perp.get("limits") or {}).get("amount") or {}
+        min_perp = sfloat(lim_perp.get("min"), 0.0)
+        base_min = max(min_spot, min_perp)
+        if base_min <= 0.0:
+            return 0.0
+        # запас на комиссии 0.2%
+        return (base_min * px) / 0.998
+    except Exception:
+        return 0.0
+
 def local_datetime() -> dt.datetime:
     return now() + dt.timedelta(minutes=cfg.tz_offset_min)
 
@@ -487,16 +512,20 @@ def main():
                     scale = max(1.0, min(scale, cfg.alloc_scale_cap))
                     scaled_alloc = per_pair_alloc * scale
 
+                # учёт минимального размера ордера спота/перпа (в USDT)
+                min_quote = min_quote_required(sym)
+                effective_alloc = max(scaled_alloc, min_quote)
+
                 # вход
                 can_enter = (
                     (not hedged)
                     and (fr >= dyn_thr)
-                    and (free >= max(scaled_alloc, cfg.min_free))
+                    and (free >= max(effective_alloc, cfg.min_free))
                     and (not in_funding_quiet_period())
                 )
                 if can_enter:
                     try:
-                        base, _ = order_spot_buy(sym, scaled_alloc)
+                        base, _ = order_spot_buy(sym, effective_alloc)
                         try:
                             _ = order_perp_sell(sym, base)
                         except Exception as e:
@@ -508,10 +537,10 @@ def main():
                             raise e
                         con.execute(
                             "INSERT INTO trades(ts,sym,action,base,quote,info) VALUES(?,?,?,?,?,?)",
-                            (now_s(), sym, "open_pair", base, scaled_alloc, f"fr={fr}")
+                            (now_s(), sym, "open_pair", base, effective_alloc, f"fr={fr} min_quote={min_quote:.4f}")
                         )
                         con.commit()
-                        tg(f"🟢 L1 OPEN {sym} (perp {perp}) • FR={fr:.5f} thr={dyn_thr:.5f} • alloc≈{scaled_alloc:.2f} USDT")
+                        tg(f"🟢 L1 OPEN {sym} (perp {perp}) • FR={fr:.5f} thr={dyn_thr:.5f} • alloc≈{effective_alloc:.2f} USDT")
                         time.sleep(2)
                         continue
                     except Exception as e:

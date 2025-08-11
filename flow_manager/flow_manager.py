@@ -32,12 +32,31 @@ def sql_conn():
     return con
 
 def total_equity():
-    bal = ex.fetch_balance(params={"type":"unified"})
-    return float(bal.get("total", {}).get("USDT", 0.0))
+    bal = ex.fetch_balance(params={"type":"unified"}) or {}
+    total = (bal.get("total") or {})
+    usdt_total = float(total.get("USDT", 0.0))
+    return usdt_total
 
 def available_usdt():
-    bal = ex.fetch_balance(params={"type":"unified"})
-    return float(bal.get("free", {}).get("USDT", 0.0))
+    bal = ex.fetch_balance(params={"type":"unified"}) or {}
+    free = (bal.get("free") or {})
+    usdt_free = float(free.get("USDT", 0.0) or 0.0)
+    if usdt_free == 0.0:
+        try:
+            acct = (cfg.acct or "UNIFIED").upper()
+            wb = ex.private_get_v5_account_wallet_balance({"accountType": acct})
+            coin_list = ((((wb or {}).get("result") or {}).get("list") or [{}])[0].get("coin") or [])
+            for c in coin_list:
+                if (c.get("coin") or "").upper() == "USDT":
+                    ab = float(c.get("availableBalance") or 0.0)
+                    if ab <= 0.0:
+                        ab = float(c.get("availableToWithdraw") or 0.0)
+                    if ab > 0.0:
+                        usdt_free = ab
+                    break
+        except Exception:
+            pass
+    return usdt_free
 
 def auto_transfer_to_sub(amount_usdt: float) -> str:
     # Варианты: перевод в субаккаунт по API. В ccxt => transfer()

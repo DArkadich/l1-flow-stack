@@ -1,5 +1,6 @@
 import os, time, math, sqlite3, datetime as dt
 from typing import List, Dict, Any
+import statistics
 
 import ccxt
 from pydantic import BaseModel, Field, field_validator
@@ -35,9 +36,12 @@ def dlog(msg: str):
 
 # ---------- Конфиг ----------
 class Cfg(BaseModel):
+    # Bybit/API
     key: str = Field(..., alias="BYBIT_API_KEY")
     sec: str = Field(..., alias="BYBIT_API_SECRET")
     acct: str = Field(..., alias="BYBIT_ACCOUNT_TYPE")
+
+    # Торговые параметры L1
     symbols: List[str] = Field(..., alias="L1_SYMBOLS")
     fr_thr: float = Field(..., alias="L1_FUNDING_THRESHOLD_8H")
     max_alloc: float = Field(..., alias="L1_MAX_ALLOC_PCT")
@@ -45,11 +49,24 @@ class Cfg(BaseModel):
     min_free: float = Field(..., alias="L1_MIN_FREE_BALANCE_USDT")
     poll: int = Field(..., alias="L1_POLL_INTERVAL_SEC")
     dd_day: float = Field(..., alias="L1_MAX_DAILY_DD_PCT")
+
+    # Автокомпаунд/переводы
     start_base: float = Field(..., alias="L1_START_BASE_USDT")
     pnl_thr_to_l2: float = Field(..., alias="L1_PNL_THRESHOLD_TO_L2")
     pnl_export_share: float = Field(..., alias="L1_PNL_EXPORT_SHARE")
+
+    # Telegram
     tg_token: str = Field(..., alias="TG_BOT_TOKEN")
     tg_chat: str = Field(..., alias="TG_CHAT_ID")
+
+    # Хук динамического порога funding + репорты по времени суток
+    dyn_hook: bool = Field(False, alias="L1_DYN_HOOK_ENABLE")
+    fr_lower: float = Field(0.00005, alias="L1_DYN_HOOK_FR_LOWER")
+    fr_upper: float = Field(0.00020, alias="L1_DYN_HOOK_FR_UPPER")
+    tz_offset_min: int = Field(0, alias="L1_TZ_OFFSET_MINUTES")  # смещение от UTC в минутах (например, МСК = +180)
+    day_start_h: int = Field(9, alias="L1_DAY_START_HOUR")       # начало дневных часов (локальных)
+    day_end_h: int = Field(21, alias="L1_DAY_END_HOUR")          # конец дневных часов (локальных, невключительно)
+    report_top_n: int = Field(4, alias="L1_REPORT_TOP_N")
 
     @field_validator("symbols", mode="before")
     @classmethod
@@ -94,7 +111,6 @@ def to_perp_symbol(sym_spot: str) -> str:
         if m.get("base") == base and m.get("quote") in (quote, "USDT"):
             return m["symbol"]
 
-    # лог для понимания, если перп не найден
     dlog(f"[to_perp_symbol] не найден swap для {sym_spot}, fallback на спот")
     return sym_spot
 
@@ -268,12 +284,37 @@ def order_close_pair(sym: str):
     except Exception as e:
         print("order_close_pair error:", e)
 
+# ---------- Время суток и динамический порог ----------
+
+def local_hour_24() -> int:
+    """Текущий локальный час (0-23) с учётом cfg.tz_offset_min относительно UTC."""
+    return int(((now() + dt.timedelta(minutes=cfg.tz_offset_min)).hour) % 24)
+
+def is_daytime() -> bool:
+    h = local_hour_24()
+    return cfg.day_start_h <= h < cfg.day_end_h
+
+def current_fr_threshold(fr_values: List[float]) -> float:
+    """Динамический хук: если рынок "плоский" (медиана низкая) — снижаем порог, если горячий — поднимаем.
+    В противном случае — базовый cfg.fr_thr."""
+    if not cfg.dyn_hook or not fr_values:
+        return cfg.fr_thr
+    med = statistics.median(fr_values)
+    # границы берём из конфигурации
+    low, base, high = cfg.fr_lower, cfg.fr_thr, cfg.fr_upper
+    if med <= (low + base) / 2:
+        return low
+    if med >= (base + high) / 2:
+        return high
+    return base
+
 
 def in_funding_window() -> bool:
     # за 2–3 минуты до часа (00/08/16 UTC)
     t = now()
     return t.minute in (57, 58)
 
+# ---------- Учёт/PNL ----------
 
 def update_daily_pnl(con, prev_equity: float, new_equity: float):
     d = daily_key()
@@ -303,6 +344,9 @@ def main():
         sset(con, "L1_base_equity", cfg.start_base)
     last_equity = total_equity()
 
+    # для часового отчёта по funding
+    last_report_tag = sget(con, "last_report_tag", "")  # формат YYYY-MM-DD_HH локальный
+
     while True:
         try:
             # инициализация дневных метрик
@@ -326,22 +370,31 @@ def main():
             update_daily_pnl(con, last_equity, eq)
             last_equity = eq
             free = free_equity()
+
+            # ------- считываем FR по всем парам сразу и рассчитываем динамический порог -------
+            fr_map: Dict[str, float] = {}
+            px_map: Dict[str, float] = {}
+            for sym in cfg.symbols:
+                fr_map[sym] = funding_8h(sym)
+                px_map[sym] = mark(sym)
+            dyn_thr = current_fr_threshold(list(fr_map.values()))
+
             per_pair_alloc = max(0.0, eq * cfg.max_alloc)
 
             for sym in cfg.symbols:
                 perp = to_perp_symbol(sym)
-                fr = funding_8h(sym)
-                px = mark(sym)
+                fr = fr_map[sym]
+                px = px_map[sym]
                 if px <= 0:
                     dlog(f"{now_s()} [{sym}] perp={perp} mark price unavailable, skip")
                     continue
 
                 pos = positions(sym)
                 hedged = (pos["spot"] > 1e-6) and (pos["perp"] < -1e-6) and (abs(pos["perp"]) >= pos["spot"] * 0.95)
-                msg = f"[{sym} | perp={perp}] FR(8h)={fr:.6f} px={px:.2f} hedged={hedged}"
+                msg = f"[{sym} | perp={perp}] FR(8h)={fr:.6f} (thr={dyn_thr:.6f}) px={px:.2f} hedged={hedged}"
 
                 # вход
-                can_enter = (not hedged) and (fr >= cfg.fr_thr) and (free >= max(per_pair_alloc, cfg.min_free)) and (not in_funding_window())
+                can_enter = (not hedged) and (fr >= dyn_thr) and (free >= max(per_pair_alloc, cfg.min_free)) and (not in_funding_window())
                 if can_enter:
                     try:
                         base, _ = order_spot_buy(sym, per_pair_alloc)
@@ -351,7 +404,7 @@ def main():
                             (now_s(), sym, "open_pair", base, per_pair_alloc, f"fr={fr}")
                         )
                         con.commit()
-                        tg(f"🟢 L1 OPEN {sym} (perp {perp}) • FR={fr:.5f} • alloc≈{per_pair_alloc:.2f} USDT")
+                        tg(f"🟢 L1 OPEN {sym} (perp {perp}) • FR={fr:.5f} thr={dyn_thr:.5f} • alloc≈{per_pair_alloc:.2f} USDT")
                         time.sleep(2)
                         continue
                     except Exception as e:
@@ -375,6 +428,20 @@ def main():
                         tg(f"⚠️ Не удалось закрыть связку {sym} (perp {perp}): {e}")
 
                 print(f"{now_s()} {msg} OK")
+
+            # ------- Часовой отчёт по funding только в дневные часы -------
+            if is_daytime():
+                tag = (now() + dt.timedelta(minutes=cfg.tz_offset_min)).strftime("%Y-%m-%d_%H")
+                if tag != last_report_tag:
+                    last_report_tag = tag
+                    sset(con, "last_report_tag", last_report_tag)
+                    # топ N по FR
+                    top = sorted(fr_map.items(), key=lambda kv: kv[1], reverse=True)[:max(1, cfg.report_top_n)]
+                    lines = [f"⏰ Дневной отчёт FR (локал.час {local_hour_24():02d}) • dyn_thr={dyn_thr:.5f}"]
+                    for sym, frv in top:
+                        lines.append(f"• {sym}: {frv:.5f}")
+                    tg("
+".join(lines))
 
             time.sleep(cfg.poll)
 

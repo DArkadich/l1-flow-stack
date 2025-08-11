@@ -51,6 +51,15 @@ def available_usdt():
                     ab = float(c.get("availableBalance") or 0.0)
                     if ab <= 0.0:
                         ab = float(c.get("availableToWithdraw") or 0.0)
+                    if ab <= 0.0:
+                        wbv = float(c.get("walletBalance") or 0.0)
+                        locked = float(c.get("locked") or 0.0)
+                        im_ord = float(c.get("totalOrderIM") or 0.0)
+                        im_pos = float(c.get("totalPositionIM") or 0.0)
+                        acci = float(c.get("accruedInterest") or 0.0)
+                        est = wbv - (locked + im_ord + im_pos + acci)
+                        if est > 0.0:
+                            ab = est
                     if ab > 0.0:
                         usdt_free = ab
                     break

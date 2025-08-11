@@ -163,6 +163,16 @@ def fetch_balance_safe() -> Dict[str, Dict[str, float]]:
                         ab = sfloat(c.get("availableBalance"), 0.0)
                         if ab <= 0.0:
                             ab = sfloat(c.get("availableToWithdraw"), 0.0)
+                        if ab <= 0.0:
+                            # Оценка free через walletBalance - залоки/маржа/проценты
+                            wbv = sfloat(c.get("walletBalance"), 0.0)
+                            locked = sfloat(c.get("locked"), 0.0)
+                            im_ord = sfloat(c.get("totalOrderIM"), 0.0)
+                            im_pos = sfloat(c.get("totalPositionIM"), 0.0)
+                            acci = sfloat(c.get("accruedInterest"), 0.0)
+                            est = wbv - (locked + im_ord + im_pos + acci)
+                            if est > 0.0:
+                                ab = est
                         if ab > 0.0:
                             free["USDT"] = ab
                         break

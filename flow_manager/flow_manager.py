@@ -28,6 +28,7 @@ def tg(msg: str):
 
 def sql_conn():
     con = sqlite3.connect(DB_PATH)
+    con.execute("CREATE TABLE IF NOT EXISTS state(k TEXT PRIMARY KEY, v TEXT)")
     return con
 
 def total_equity():
@@ -59,6 +60,13 @@ def main():
     while True:
         try:
             con = sql_conn()
+            # синхронизируем стартовую базу из SQLite, если есть
+            cur = con.execute("SELECT v FROM state WHERE k=?", ("L1_START_BASE_USDT",)).fetchone()
+            if cur:
+                try:
+                    cfg.start_base = float(cur[0])
+                except Exception:
+                    pass
             eq = total_equity()
             start = cfg.start_base
             # прибыль L1 как (equity - start) — в простом варианте, т.к. L1 — единственный потребитель капитала в этом стеке
@@ -83,7 +91,6 @@ def main():
                     # Обновляем «стартовую базу» под новую ступень, чтобы компаунд продолжался
                     new_start = start + export_amt
                     # сохраняем в state
-                    con.execute("CREATE TABLE IF NOT EXISTS state(k TEXT PRIMARY KEY, v TEXT)")
                     con.execute("INSERT OR REPLACE INTO state(k,v) VALUES(?,?)", ("L1_START_BASE_USDT", str(new_start)))
                     con.commit()
                     cfg.start_base = new_start

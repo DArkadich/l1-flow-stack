@@ -69,6 +69,11 @@ class Cfg(BaseModel):
     report_top_n: int = Field(4, alias="L1_REPORT_TOP_N")
     report_min_fr: float = Field(0.0, alias="L1_REPORT_MIN_FR")  # фильтр в отчёте
 
+    # Динамическое масштабирование аллокации под высокий FR
+    alloc_scale_enable: bool = Field(True, alias="L1_ALLOC_SCALE_ENABLE")
+    alloc_scale_k: float = Field(0.5, alias="L1_ALLOC_SCALE_K")
+    alloc_scale_cap: float = Field(1.5, alias="L1_ALLOC_SCALE_CAP")
+
     @field_validator("symbols", mode="before")
     @classmethod
     def parse_symbols(cls, v):
@@ -340,25 +345,46 @@ def in_funding_window() -> bool:
     t = now()
     return t.minute in (57, 58)
 
+
+def minutes_since_prev_funding_window() -> int:
+    """Минут с момента предыдущего окна выплаты funding (00:00, 08:00, 16:00 UTC)."""
+    t = now()
+    windows = [0, 8, 16]
+    prev_point = None
+    for i in range(24):
+        cand = (t - dt.timedelta(hours=i)).replace(minute=0, second=0, microsecond=0)
+        if cand.hour in windows and cand < t:
+            prev_point = cand
+            break
+    if prev_point is None:
+        prev_point = (t - dt.timedelta(days=1)).replace(hour=16, minute=0, second=0, microsecond=0)
+    return max(0, int((t - prev_point).total_seconds() // 60))
+
+
+def in_funding_quiet_period() -> bool:
+    """Тихое окно вокруг payout: не входим за 5 минут до него и 2 минуты после."""
+    return minutes_to_next_funding_window() <= 5 or minutes_since_prev_funding_window() <= 2
+
 # ---------- Учёт/PNL ----------
 
-def update_daily_pnl(con, prev_equity: float, new_equity: float):
+def update_daily_pnl(con, day_start_equity: float, current_equity: float):
+    """Сохраняет накопленный дневной PnL: equity_today - day_start_equity."""
     d = daily_key()
-    pnl = (new_equity - prev_equity) if prev_equity > 0 else 0.0
+    pnl_today = (current_equity - day_start_equity) if day_start_equity > 0 else 0.0
     cur = con.execute("SELECT pnl FROM daily_pnl WHERE d=?", (d,)).fetchone()
     if cur:
-        con.execute("UPDATE daily_pnl SET pnl=? WHERE d=?", (pnl, d))
+        con.execute("UPDATE daily_pnl SET pnl=? WHERE d=?", (pnl_today, d))
     else:
-        con.execute("INSERT INTO daily_pnl(d,pnl) VALUES(?,?)", (d, pnl))
+        con.execute("INSERT INTO daily_pnl(d,pnl) VALUES(?,?)", (d, pnl_today))
     con.commit()
-    return pnl
+    return pnl_today
 
 
 def daily_drawdown_exceeded(con, start_e: float):
     d = daily_key()
     cur = con.execute("SELECT pnl FROM daily_pnl WHERE d=?", (d,)).fetchone()
-    pnl = sfloat(cur[0], 0.0) if cur else 0.0
-    dd_pct = (-pnl / start_e * 100.0) if start_e > 0 and pnl < 0 else 0.0
+    pnl_today = sfloat(cur[0], 0.0) if cur else 0.0
+    dd_pct = (-(pnl_today) / start_e * 100.0) if start_e > 0 and pnl_today < 0 else 0.0
     return dd_pct >= cfg.dd_day, dd_pct
 
 # ---------- Основной цикл ----------
@@ -366,8 +392,12 @@ def daily_drawdown_exceeded(con, start_e: float):
 def main():
     con = sql_conn()
     tg("🚀 L1 бот (автокомпаунд, дневные отчёты, dyn-threshold) запущен.")
-    if not sget(con, "L1_base_equity", ""):
-        sset(con, "L1_base_equity", cfg.start_base)
+    # Синхронизация стартовой базы с SQLite
+    saved_base = sget(con, "L1_START_BASE_USDT", "")
+    if saved_base:
+        cfg.start_base = sfloat(saved_base, cfg.start_base)
+    else:
+        sset(con, "L1_START_BASE_USDT", cfg.start_base)
     last_equity = total_equity()
 
     last_report_tag = sget(con, "last_report_tag", "")  # YYYY-MM-DD_HH (локально)
@@ -392,7 +422,7 @@ def main():
                 continue
 
             eq = total_equity()
-            update_daily_pnl(con, last_equity, eq)
+            update_daily_pnl(con, day_start_equity, eq)
             last_equity = eq
             free = free_equity()
 
@@ -418,18 +448,39 @@ def main():
                 hedged = (pos["spot"] > 1e-6) and (pos["perp"] < -1e-6) and (abs(pos["perp"]) >= pos["spot"] * 0.95)
                 msg = f"[{sym} | perp={perp}] FR(8h)={fr:.6f} (thr={dyn_thr:.6f}) px={px:.2f} hedged={hedged}"
 
+                # динамическое масштабирование аллокации при высоком FR
+                scaled_alloc = per_pair_alloc
+                if cfg.alloc_scale_enable and dyn_thr > 0:
+                    excess = max(0.0, fr - dyn_thr)
+                    scale = 1.0 + cfg.alloc_scale_k * (excess / max(dyn_thr, 1e-9))
+                    scale = max(1.0, min(scale, cfg.alloc_scale_cap))
+                    scaled_alloc = per_pair_alloc * scale
+
                 # вход
-                can_enter = (not hedged) and (fr >= dyn_thr) and (free >= max(per_pair_alloc, cfg.min_free)) and (not in_funding_window())
+                can_enter = (
+                    (not hedged)
+                    and (fr >= dyn_thr)
+                    and (free >= max(scaled_alloc, cfg.min_free))
+                    and (not in_funding_quiet_period())
+                )
                 if can_enter:
                     try:
-                        base, _ = order_spot_buy(sym, per_pair_alloc)
-                        _ = order_perp_sell(sym, base)
+                        base, _ = order_spot_buy(sym, scaled_alloc)
+                        try:
+                            _ = order_perp_sell(sym, base)
+                        except Exception as e:
+                            # компенсируем спот, если перп не открылся
+                            try:
+                                _ = ex.create_order(sym, type="market", side="sell", amount=base)
+                            except Exception as e2:
+                                print("compensation sell spot failed:", e2)
+                            raise e
                         con.execute(
                             "INSERT INTO trades(ts,sym,action,base,quote,info) VALUES(?,?,?,?,?,?)",
-                            (now_s(), sym, "open_pair", base, per_pair_alloc, f"fr={fr}")
+                            (now_s(), sym, "open_pair", base, scaled_alloc, f"fr={fr}")
                         )
                         con.commit()
-                        tg(f"🟢 L1 OPEN {sym} (perp {perp}) • FR={fr:.5f} thr={dyn_thr:.5f} • alloc≈{per_pair_alloc:.2f} USDT")
+                        tg(f"🟢 L1 OPEN {sym} (perp {perp}) • FR={fr:.5f} thr={dyn_thr:.5f} • alloc≈{scaled_alloc:.2f} USDT")
                         time.sleep(2)
                         continue
                     except Exception as e:

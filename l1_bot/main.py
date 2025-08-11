@@ -514,6 +514,11 @@ def main():
 
                 # учёт минимального размера ордера спота/перпа (в USDT)
                 min_quote = min_quote_required(sym)
+                # если минимально допустимая аллокация слишком велика относительно equity — пропускаем пару,
+                # чтобы не ловить ошибки недостатка доступного баланса в Unified
+                if min_quote > 0 and min_quote > eq * 0.8:
+                    dlog(f"{now_s()} [{sym}] min_quote≈{min_quote:.2f} USDT > 80% equity≈{eq:.2f}, skip")
+                    continue
                 effective_alloc = max(scaled_alloc, min_quote)
 
                 # вход

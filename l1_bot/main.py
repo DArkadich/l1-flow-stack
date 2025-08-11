@@ -530,15 +530,24 @@ def main():
                 )
                 if can_enter:
                     try:
-                        base, _ = order_spot_buy(sym, effective_alloc)
+                        # 1) сначала открываем перп-шорт, чтобы не съесть USDT под маржу покупкой спота
+                        px_enter = px
+                        base = round((effective_alloc / px_enter) * 0.998, 6)
                         try:
                             _ = order_perp_sell(sym, base)
                         except Exception as e:
-                            # компенсируем спот, если перп не открылся
+                            raise e
+
+                        # 2) затем покупаем спот тем же количеством базовой валюты
+                        try:
+                            _ = ex.create_order(sym, type="market", side="buy", amount=base)
+                        except Exception as e:
+                            # откатываем перп при неуспехе спота
                             try:
-                                _ = ex.create_order(sym, type="market", side="sell", amount=base)
+                                perp = to_perp_symbol(sym)
+                                _ = ex.create_order(perp, type="market", side="buy", amount=base, params={"reduceOnly": True})
                             except Exception as e2:
-                                print("compensation sell spot failed:", e2)
+                                print("compensation close perp failed:", e2)
                             raise e
                         con.execute(
                             "INSERT INTO trades(ts,sym,action,base,quote,info) VALUES(?,?,?,?,?,?)",

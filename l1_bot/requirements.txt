@@ -1,0 +1,6 @@
+ccxt==4.4.24
+python-telegram-bot==13.15
+pydantic==2.8.2
+pandas==2.2.2
+requests==2.32.3
+sqlalchemy==2.0.31

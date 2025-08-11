@@ -1,0 +1,26 @@
+version: "3.9"
+
+services:
+  l1_bot:
+    build: ./l1_bot
+    container_name: l1_bot
+    restart: always
+    env_file: .env
+    volumes:
+      - ./shared:/app/shared
+      - ./logs:/app/logs
+
+  flow_manager:
+    build: ./flow_manager
+    container_name: flow_manager
+    restart: always
+    env_file: .env
+    volumes:
+      - ./shared:/app/shared
+      - ./logs:/app/logs
+
+  node_exporter:
+    image: prom/node-exporter:latest
+    container_name: node_exporter
+    restart: always
+    network_mode: host

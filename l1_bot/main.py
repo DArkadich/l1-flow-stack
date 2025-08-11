@@ -148,6 +148,27 @@ def fetch_balance_safe() -> Dict[str, Dict[str, float]]:
         total = {k: sfloat(v, 0.0) for k, v in (bal.get("total") or {}).items()}
         free = {k: sfloat(v, 0.0) for k, v in (bal.get("free") or {}).items()}
         used = {k: sfloat(v, 0.0) for k, v in (bal.get("used") or {}).items()}
+
+        # Фоллбэк для Bybit UNIFIED: иногда ccxt возвращает None для free; берём из v5 wallet-balance
+        usdt_total = sfloat(total.get("USDT"), 0.0)
+        usdt_free = sfloat(free.get("USDT"), 0.0)
+        if usdt_total > 0.0 and usdt_free == 0.0:
+            try:
+                acct = (cfg.acct or "UNIFIED").upper()
+                wb = ex.private_get_v5_account_wallet_balance({"accountType": acct})
+                coin_list = ((((wb or {}).get("result") or {}).get("list") or [{}])[0].get("coin") or [])
+                for c in coin_list:
+                    if (c.get("coin") or "").upper() == "USDT":
+                        # availableBalance — эквивалент свободных средств для торговли
+                        ab = sfloat(c.get("availableBalance"), 0.0)
+                        if ab <= 0.0:
+                            ab = sfloat(c.get("availableToWithdraw"), 0.0)
+                        if ab > 0.0:
+                            free["USDT"] = ab
+                        break
+            except Exception as e:
+                if TRACE_API:
+                    dlog(f"[fetch_balance_safe] v5 wallet-balance fallback error: {e}")
         return {"total": total, "free": free, "used": used}
     except Exception as e:
         print("fetch_balance_safe error:", e)

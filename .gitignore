@@ -1,0 +1,30 @@
+# === Секреты и конфиги ===
+.env
+.env.*
+!*.env.example
+
+# === Логи ===
+logs/
+*.log
+*.log.*
+log/
+
+# === База данных (SQLite) ===
+shared/*.db
+shared/*.sqlite
+shared/*.sqlite3
+
+# === Python кеш ===
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pkl
+
+# === Docker ===
+*.pid
+*.sock
+
+# === Разное ===
+.DS_Store
+Thumbs.db

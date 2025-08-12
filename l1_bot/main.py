@@ -139,6 +139,14 @@ def sset(con, k, v):
     con.execute("INSERT OR REPLACE INTO state(k,v) VALUES(?,?)", (k, str(v)))
     con.commit()
 
+
+def is_marked_open(con, sym: str) -> bool:
+    return sget(con, f"pair:{sym}:open", "0") == "1"
+
+
+def mark_open(con, sym: str, opened: bool):
+    sset(con, f"pair:{sym}:open", "1" if opened else "0")
+
 # ---------- Безопасные обёртки к API ----------
 
 def fetch_balance_safe() -> Dict[str, Dict[str, float]]:
@@ -506,6 +514,9 @@ def main():
 
                 pos = positions(sym)
                 hedged = (pos["spot"] > 1e-6) and (pos["perp"] < -1e-6) and (abs(pos["perp"]) >= pos["spot"] * 0.95)
+                if is_marked_open(con, sym) and not hedged:
+                    # пометка устарела — очищаем
+                    mark_open(con, sym, False)
                 msg = f"[{sym} | perp={perp}] FR(8h)={fr:.6f} (thr={dyn_thr:.6f}) px={px:.2f} hedged={hedged}"
 
                 # динамическое масштабирование аллокации при высоком FR
@@ -532,14 +543,16 @@ def main():
                     and (free >= max(effective_alloc, cfg.min_free))
                     and (not in_funding_quiet_period())
                 )
-                if can_enter:
+                if can_enter and not is_marked_open(con, sym):
                     try:
+                        mark_open(con, sym, True)
                         # 1) сначала открываем перп-шорт, чтобы не съесть USDT под маржу покупкой спота
                         px_enter = px
                         base = round((effective_alloc / px_enter) * 0.998, 6)
                         try:
                             _ = order_perp_sell(sym, base)
                         except Exception as e:
+                            mark_open(con, sym, False)
                             raise e
 
                         # 2) затем покупаем спот тем же количеством базовой валюты
@@ -552,6 +565,7 @@ def main():
                                 _ = ex.create_order(perp, type="market", side="buy", amount=base, params={"reduceOnly": True})
                             except Exception as e2:
                                 print("compensation close perp failed:", e2)
+                            mark_open(con, sym, False)
                             raise e
                         con.execute(
                             "INSERT INTO trades(ts,sym,action,base,quote,info) VALUES(?,?,?,?,?,?)",
@@ -560,6 +574,8 @@ def main():
                         con.commit()
                         tg(f"🟢 L1 OPEN {sym} (perp {perp}) • FR={fr:.5f} thr={dyn_thr:.5f} • alloc≈{effective_alloc:.2f} USDT")
                         time.sleep(2)
+                        # сбрасываем пометку, чтобы не мешать повторным входам в будущем
+                        mark_open(con, sym, False)
                         continue
                     except Exception as e:
                         print("open_pair error:", e)

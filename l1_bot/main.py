@@ -49,6 +49,7 @@ class Cfg(BaseModel):
     min_free: float = Field(..., alias="L1_MIN_FREE_BALANCE_USDT")
     poll: int = Field(..., alias="L1_POLL_INTERVAL_SEC")
     dd_day: float = Field(..., alias="L1_MAX_DAILY_DD_PCT")
+    dd_min_eq: float = Field(200.0, alias="L1_DD_MIN_EQUITY_USDT")
 
     # Автокомпаунд/переводы
     start_base: float = Field(..., alias="L1_START_BASE_USDT")
@@ -440,6 +441,9 @@ def daily_drawdown_exceeded(con, start_e: float):
     d = daily_key()
     cur = con.execute("SELECT pnl FROM daily_pnl WHERE d=?", (d,)).fetchone()
     pnl_today = sfloat(cur[0], 0.0) if cur else 0.0
+    # отключаем контроль DD для малых депозитов, где mark-to-market шум непропорционален
+    if start_e < max(1.0, cfg.dd_min_eq):
+        return False, 0.0
     dd_pct = (-(pnl_today) / start_e * 100.0) if start_e > 0 and pnl_today < 0 else 0.0
     return dd_pct >= cfg.dd_day, dd_pct
 

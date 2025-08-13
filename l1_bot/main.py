@@ -75,6 +75,19 @@ class Cfg(BaseModel):
     alloc_scale_k: float = Field(0.5, alias="L1_ALLOC_SCALE_K")
     alloc_scale_cap: float = Field(1.5, alias="L1_ALLOC_SCALE_CAP")
 
+    # Исполнение и фильтры качества
+    fr_extra_buffer: float = Field(0.00002, alias="L1_FR_EXTRA_BUFFER")
+    max_spread_pct: float = Field(0.003, alias="L1_MAX_SPREAD_PCT")  # 0.3%
+
+    # Выходы и гистерезис
+    hysteresis_fr: float = Field(0.00002, alias="L1_HYST_FR")
+    exit_fr_below_count: int = Field(3, alias="L1_EXIT_FR_BELOW_COUNT")
+    max_hold_min: int = Field(0, alias="L1_MAX_HOLD_MIN")  # 0 = отключено
+    cooldown_min: int = Field(10, alias="L1_COOLDOWN_MIN")
+
+    # Совокупная аллокация
+    max_total_alloc: float = Field(0.6, alias="L1_MAX_TOTAL_ALLOC_PCT")
+
     @field_validator("symbols", mode="before")
     @classmethod
     def parse_symbols(cls, v):
@@ -118,6 +131,12 @@ def to_perp_symbol(sym_spot: str) -> str:
 def sql_conn():
     os.makedirs("/app/shared", exist_ok=True)
     con = sqlite3.connect(DB_PATH)
+    try:
+        con.execute("PRAGMA journal_mode=WAL;")
+        con.execute("PRAGMA synchronous=NORMAL;")
+        con.execute("PRAGMA busy_timeout=3000;")
+    except Exception:
+        pass
     con.execute("""CREATE TABLE IF NOT EXISTS state(k TEXT PRIMARY KEY, v TEXT);""")
     con.execute("""CREATE TABLE IF NOT EXISTS trades(
         ts TEXT, sym TEXT, action TEXT, base REAL, quote REAL, info TEXT);""")
@@ -245,6 +264,21 @@ def funding_8h(sym: str) -> float:
         return 0.0
 
 
+def spread_pct(sym: str) -> float:
+    try:
+        t = ex.fetch_ticker(sym) or {}
+        bid = sfloat(t.get("bid"), 0.0)
+        ask = sfloat(t.get("ask"), 0.0)
+        if bid > 0 and ask > 0 and ask >= bid:
+            mid = (bid + ask) / 2.0
+            if mid > 0:
+                return (ask - bid) / mid
+        return 0.0
+    except Exception as e:
+        print("spread_pct error:", e)
+        return 0.0
+
+
 def set_leverage(sym: str, lev: int):
     try:
         perp = to_perp_symbol(sym)
@@ -346,11 +380,30 @@ def min_quote_required(sym: str) -> float:
         m_perp = ex.market(perp)
         lim_perp = (m_perp.get("limits") or {}).get("amount") or {}
         min_perp = sfloat(lim_perp.get("min"), 0.0)
+        # также учитываем стоимостные минимумы, если заданы
+        cost_spot_min = sfloat(((m_spot.get("limits") or {}).get("cost") or {}).get("min"), 0.0)
+        cost_perp_min = sfloat(((m_perp.get("limits") or {}).get("cost") or {}).get("min"), 0.0)
         base_min = max(min_spot, min_perp)
         if base_min <= 0.0:
             return 0.0
         # запас на комиссии 0.2%
-        return (base_min * px) / 0.998
+        quote_req = (base_min * px) / 0.998
+        if cost_spot_min > 0:
+            quote_req = max(quote_req, cost_spot_min)
+        if cost_perp_min > 0:
+            quote_req = max(quote_req, cost_perp_min)
+        return quote_req
+
+
+def round_amount(sym: str, amount: float) -> float:
+    try:
+        m = ex.market(sym)
+        prec = (m.get("precision") or {}).get("amount")
+        if isinstance(prec, int) and prec >= 0:
+            return float(f"{amount:.{prec}f}")
+    except Exception:
+        pass
+    return round(amount, 6)
     except Exception:
         return 0.0
 
@@ -536,19 +589,35 @@ def main():
                     continue
                 effective_alloc = max(scaled_alloc, min_quote)
 
+                # доп. фильтры: спред, FR-буфер, совокупная аллокация
+                spr = spread_pct(sym)
+                total_used_approx = max(0.0, eq - free)  # приблизительно: занято = equity - free
+                total_after = total_used_approx + effective_alloc
+                total_cap = eq * max(0.0, min(cfg.max_total_alloc, 0.99))
+
+                # гистерезис удержания: снижение порога для проверки выхода (ниже)
+                hold_thr = max(0.0, dyn_thr - cfg.hysteresis_fr)
+
                 # вход
                 can_enter = (
                     (not hedged)
-                    and (fr >= dyn_thr)
+                    and (fr >= (dyn_thr + cfg.fr_extra_buffer))
                     and (free >= max(effective_alloc, cfg.min_free))
                     and (not in_funding_quiet_period())
+                    and (spr <= cfg.max_spread_pct)
+                    and (total_after <= total_cap)
                 )
-                if can_enter and not is_marked_open(con, sym):
+                # cooldown
+                cd_until = int(sfloat(sget(con, f"cooldown_until:{sym}", "0"), 0.0))
+                now_ts = int(now().timestamp())
+                not_in_cooldown = now_ts >= cd_until
+
+                if can_enter and not is_marked_open(con, sym) and not_in_cooldown:
                     try:
                         mark_open(con, sym, True)
                         # 1) сначала открываем перп-шорт, чтобы не съесть USDT под маржу покупкой спота
                         px_enter = px
-                        base = round((effective_alloc / px_enter) * 0.998, 6)
+                        base = round_amount(sym, (effective_alloc / px_enter) * 0.998)
                         try:
                             _ = order_perp_sell(sym, base)
                         except Exception as e:
@@ -567,6 +636,8 @@ def main():
                                 print("compensation close perp failed:", e2)
                             mark_open(con, sym, False)
                             raise e
+                        # отметка времени открытия
+                        sset(con, f"open_ts:{sym}", str(now_ts))
                         con.execute(
                             "INSERT INTO trades(ts,sym,action,base,quote,info) VALUES(?,?,?,?,?,?)",
                             (now_s(), sym, "open_pair", base, effective_alloc, f"fr={fr} min_quote={min_quote:.4f}")
@@ -582,7 +653,27 @@ def main():
                         tg(f"⚠️ Не удалось открыть связку {sym} (perp {perp}): {e}")
 
                 # выход по отрицательному funding
-                if hedged and fr < -0.00005:
+                below_key = f"below_thr_count:{sym}"
+                if hedged:
+                    if fr < hold_thr:
+                        cnt = int(sfloat(sget(con, below_key, "0"), 0.0)) + 1
+                        sset(con, below_key, str(cnt))
+                    else:
+                        if sget(con, below_key, "0") != "0":
+                            sset(con, below_key, "0")
+
+                exit_due_to_negative = hedged and (fr < -0.00005)
+                exit_due_to_below = hedged and (int(sfloat(sget(con, below_key, "0"), 0.0)) >= cfg.exit_fr_below_count)
+
+                # тайм-аут удержания
+                exit_due_to_time = False
+                if hedged and cfg.max_hold_min > 0:
+                    ots = int(sfloat(sget(con, f"open_ts:{sym}", "0"), 0.0))
+                    if ots > 0:
+                        held_min = max(0, int((now_ts - ots) // 60))
+                        exit_due_to_time = (held_min >= cfg.max_hold_min) and (fr < dyn_thr)
+
+                if exit_due_to_negative or exit_due_to_below or exit_due_to_time:
                     try:
                         order_close_pair(sym)
                         con.execute(
@@ -591,6 +682,10 @@ def main():
                         )
                         con.commit()
                         tg(f"🔴 L1 CLOSE {sym} (perp {perp}) • FR={fr:.5f}")
+                        # сброс счётчика и установка cooldown
+                        sset(con, below_key, "0")
+                        cd_until = now_ts + max(0, cfg.cooldown_min) * 60
+                        sset(con, f"cooldown_until:{sym}", str(cd_until))
                         time.sleep(2)
                         continue
                     except Exception as e:

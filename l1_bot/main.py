@@ -404,8 +404,6 @@ def round_amount(sym: str, amount: float) -> float:
     except Exception:
         pass
     return round(amount, 6)
-    except Exception:
-        return 0.0
 
 def local_datetime() -> dt.datetime:
     return now() + dt.timedelta(minutes=cfg.tz_offset_min)

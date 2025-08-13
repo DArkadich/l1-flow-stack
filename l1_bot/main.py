@@ -611,6 +611,25 @@ def main():
                 cd_until = int(sfloat(sget(con, f"cooldown_until:{sym}", "0"), 0.0))
                 now_ts = int(now().timestamp())
                 not_in_cooldown = now_ts >= cd_until
+                if EXTRA_LOGS:
+                    dbg = {
+                        "fr_ok": fr >= (dyn_thr + cfg.fr_extra_buffer),
+                        "free_ok": free >= max(effective_alloc, cfg.min_free),
+                        "not_quiet": not in_funding_quiet_period(),
+                        "spread_ok": spr <= cfg.max_spread_pct,
+                        "cap_ok": total_after <= total_cap,
+                        "not_hedged": not hedged,
+                        "not_in_cooldown": not_in_cooldown,
+                        "marked_open": is_marked_open(con, sym),
+                        "eff_alloc": round(effective_alloc, 4),
+                        "free": round(free, 4),
+                        "spr": round(spr, 6),
+                        "dyn_thr": round(dyn_thr, 6),
+                        "fr": round(fr, 6),
+                        "total_after": round(total_after, 4),
+                        "total_cap": round(total_cap, 4),
+                    }
+                    print(f"{now_s()} [ENTER_CHECK] {sym} {dbg}")
 
                 if can_enter and not is_marked_open(con, sym) and not_in_cooldown:
                     try:

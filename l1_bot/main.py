@@ -393,6 +393,8 @@ def min_quote_required(sym: str) -> float:
         if cost_perp_min > 0:
             quote_req = max(quote_req, cost_perp_min)
         return quote_req
+    except Exception:
+        return 0.0
 
 
 def round_amount(sym: str, amount: float) -> float:

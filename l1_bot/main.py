@@ -88,6 +88,12 @@ class Cfg(BaseModel):
     # Совокупная аллокация
     max_total_alloc: float = Field(0.6, alias="L1_MAX_TOTAL_ALLOC_PCT")
 
+    # Доливка (scale-in) в уже открытые связки
+    scale_in_enable: bool = Field(True, alias="L1_SCALEIN_ENABLE")
+    scale_in_min_quote: float = Field(5.0, alias="L1_SCALEIN_MIN_QUOTE_USDT")
+    scale_in_max_steps: int = Field(3, alias="L1_SCALEIN_MAX_STEPS_PER_DAY")
+    scale_in_fr_buffer: float = Field(0.0, alias="L1_SCALEIN_FR_BUFFER")
+
     @field_validator("symbols", mode="before")
     @classmethod
     def parse_symbols(cls, v):
@@ -712,6 +718,48 @@ def main():
                         tg(f"⚠️ Не удалось закрыть связку {sym} (perp {perp}): {e}")
 
                 print(f"{now_s()} {msg} OK")
+
+                # --------- ДОЛИВКА (scale-in) при высоком FR ---------
+                if cfg.scale_in_enable and hedged:
+                    # проверяем дневной лимит шагов
+                    key_steps = f"scalein_steps:{daily_key()}:{sym}"
+                    steps = int(sfloat(sget(con, key_steps, "0"), 0.0))
+                    if steps < max(0, cfg.scale_in_max_steps):
+                        # условия доливки: FR выше порога + буфер, спред ок, есть свободные средства и не в тихом окне
+                        can_scale = (
+                            fr >= (dyn_thr + max(0.0, cfg.scale_in_fr_buffer))
+                            and spr <= cfg.max_spread_pct
+                            and (not in_funding_quiet_period())
+                        )
+                        if can_scale:
+                            # размер доливки: минимум из scale_in_min_quote и доступного free, но не превышаем cap
+                            alloc_si = min(cfg.scale_in_min_quote, free)
+                            total_after_si = total_used_approx + alloc_si
+                            if alloc_si >= cfg.scale_in_min_quote and total_after_si <= total_cap:
+                                try:
+                                    # доливка: купить спот на alloc_si и долить перп шорт на то же количество базы
+                                    base_add, _ = order_spot_buy(sym, alloc_si)
+                                    try:
+                                        _ = order_perp_sell(sym, base_add)
+                                    except Exception as e:
+                                        # если перп не смогли — откатываем спот
+                                        try:
+                                            _ = ex.create_order(sym, type="market", side="sell", amount=base_add)
+                                        except Exception as e2:
+                                            print("scale-in compensation sell spot failed:", e2)
+                                        raise e
+                                    steps += 1
+                                    sset(con, key_steps, str(steps))
+                                    con.execute(
+                                        "INSERT INTO trades(ts,sym,action,base,quote,info) VALUES(?,?,?,?,?,?)",
+                                        (now_s(), sym, "scale_in", base_add, alloc_si, f"fr={fr}")
+                                    )
+                                    con.commit()
+                                    tg(f"🟦 L1 SCALE-IN {sym} • FR={fr:.5f} • +≈{alloc_si:.2f} USDT")
+                                    time.sleep(1)
+                                except Exception as e:
+                                    print("scale_in error:", e)
+                                    tg(f"⚠️ Не удалось долить {sym}: {e}")
 
             # ------- Часовой отчёт по funding только в дневные часы -------
             if is_daytime():

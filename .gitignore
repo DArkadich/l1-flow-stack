@@ -28,3 +28,4 @@ __pycache__/
 # === Разное ===
 .DS_Store
 Thumbs.db
+.env

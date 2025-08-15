@@ -86,7 +86,6 @@ class Cfg(BaseModel):
     cooldown_min: int = Field(10, alias="L1_COOLDOWN_MIN")
 
     max_total_alloc: float = Field(0.6, alias="L1_MAX_TOTAL_ALLOC_PCT")
-    # Ограничение размера позиции на пару
     max_pair_alloc_pct: float = Field(0.08, alias="L1_MAX_PAIR_ALLOC_PCT")  # 8% max per pair
 
     # Доливка (scale-in) в уже открытые связки
@@ -610,10 +609,7 @@ def check_stop_losses():
                     scale = 1.0 + cfg.alloc_scale_k * (excess / max(dyn_thr, 1e-9))
                     scale = max(1.0, min(scale, cfg.alloc_scale_cap))
                 # ограничение размера позиции на пару (максимум 8% от капитала)
-                    max_pair_alloc = eq * cfg.max_pair_alloc_pct
-                    scaled_alloc = min(scaled_alloc, max_pair_alloc)
-                # ограничение размера позиции на пару (максимум 8% от капитала)
-                    max_pair_alloc = eq * cfg.max_pair_alloc_pct
+                    max_pair_alloc = eq * cfg.max_alloc
                     scaled_alloc = min(scaled_alloc, max_pair_alloc)
                     scaled_alloc = per_pair_alloc * scale
 

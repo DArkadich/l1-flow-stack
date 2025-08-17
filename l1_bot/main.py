@@ -518,28 +518,6 @@ def daily_drawdown_exceeded(con, start_e: float):
 
 def main():
     con = sql_conn()
-def check_stop_losses():
-    """Проверка и закрытие позиций, достигших stop-loss"""
-    try:
-        positions = get_open_positions()
-        for pos in positions:
-            if pos["hedged"]:
-                # Рассчитываем текущий PnL для пары
-                spot_value = pos.get("spot_value", 0)
-                perp_pnl = pos.get("perp_pnl", 0)
-                total_pnl = spot_value + perp_pnl
-                entry_value = pos.get("entry_value", 0)
-                
-                if entry_value > 0:
-                    pnl_pct = total_pnl / entry_value
-                    
-                    # Проверяем, достигнут ли stop-loss (6% убытка)
-                    if pnl_pct <= -cfg.pair_stop_loss_pct:
-                        logger.warning(f"🛑 Stop-loss достигнут для {pos["symbol"]}: {pnl_pct:.2%}")
-                        close_pair(pos["symbol"], reason="stop_loss")
-                        
-    except Exception as e:
-        logger.error(f"Ошибка проверки stop-loss: {e}")
     tg("🚀 L1 бот (автокомпаунд, дневные отчёты, dyn-threshold) запущен.")
     # Синхронизация стартовой базы с SQLite
     saved_base = sget(con, "L1_START_BASE_USDT", "")
@@ -584,9 +562,6 @@ def check_stop_losses():
             dyn_thr = current_fr_threshold(list(fr_map.values()))
 
             per_pair_alloc = max(0.0, eq * cfg.max_alloc)
-
-            # проверка stop-loss по всем открытым позициям
-            check_stop_losses()
             for sym in cfg.symbols:
                 perp = to_perp_symbol(sym)
                 fr = fr_map[sym]

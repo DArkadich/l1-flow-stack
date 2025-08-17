@@ -62,8 +62,8 @@ class Cfg(BaseModel):
 
     # Динамический порог + дневные отчёты
     dyn_hook: bool = Field(False, alias="L1_DYN_HOOK_ENABLE")
-    fr_lower: float = Field(0.00005, alias="L1_DYN_HOOK_FR_LOWER")
-    fr_upper: float = Field(0.00020, alias="L1_DYN_HOOK_FR_UPPER")
+    fr_lower: float = Field(0.001, alias="L1_DYN_HOOK_FR_LOWER")  # 0.1% - увеличен для лучшей маржинальности
+    fr_upper: float = Field(0.003, alias="L1_DYN_HOOK_FR_UPPER")  # 0.3% - увеличен для лучшей маржинальности
     tz_offset_min: int = Field(0, alias="L1_TZ_OFFSET_MINUTES")  # смещение от UTC в минутах (МСК=180)
     day_start_h: int = Field(9, alias="L1_DAY_START_HOUR")       # [start, end) локальные часы
     day_end_h: int = Field(21, alias="L1_DAY_END_HOUR")
@@ -82,11 +82,11 @@ class Cfg(BaseModel):
     # Выходы и гистерезис
     hysteresis_fr: float = Field(0.00002, alias="L1_HYST_FR")
     exit_fr_below_count: int = Field(3, alias="L1_EXIT_FR_BELOW_COUNT")
-    max_hold_min: int = Field(0, alias="L1_MAX_HOLD_MIN")  # 0 = отключено
+    max_hold_min: int = Field(30, alias="L1_MAX_HOLD_MIN")  # 30 минут - минимальное время удержания для снижения комиссий
     cooldown_min: int = Field(10, alias="L1_COOLDOWN_MIN")
 
     max_total_alloc: float = Field(0.6, alias="L1_MAX_TOTAL_ALLOC_PCT")
-    max_pair_alloc_pct: float = Field(0.08, alias="L1_MAX_PAIR_ALLOC_PCT")  # 8% max per pair
+    max_pair_alloc_pct: float = Field(0.20, alias="L1_MAX_PAIR_ALLOC_PCT")  # 20% max per pair - увеличен для лучшей маржинальности
 
     # Доливка (scale-in) в уже открытые связки
     scale_in_enable: bool = Field(True, alias="L1_SCALEIN_ENABLE")

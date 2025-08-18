@@ -1,7 +1,6 @@
 import os, time, math, sqlite3, datetime as dt
 from typing import List, Dict, Any
 import statistics
-import time
 
 import ccxt
 from pydantic import BaseModel, Field, field_validator
@@ -88,15 +87,6 @@ class Cfg(BaseModel):
 
     max_total_alloc: float = Field(0.6, alias="L1_MAX_TOTAL_ALLOC_PCT")
     max_pair_alloc_pct: float = Field(0.20, alias="L1_MAX_PAIR_ALLOC_PCT")  # 20% max per pair - увеличен для лучшей маржинальности
-    # Maker-first (postOnly) с тайм-аутом fallback на market
-    maker_fallback_ms: int = Field(3000, alias="L1_MAKER_FALLBACK_MS")
-
-    # Snipe-режим вокруг funding payout
-    snipe_enable: bool = Field(False, alias="L1_SNIPE_ENABLE")
-    snipe_window_min: int = Field(12, alias="L1_SNIPE_WINDOW_MIN")
-    snipe_min_fr: float = Field(0.00020, alias="L1_SNIPE_MIN_FR")
-    snipe_close_after_min: int = Field(3, alias="L1_SNIPE_CLOSE_AFTER_MIN")
-
 
     # Доливка (scale-in) в уже открытые связки
     scale_in_enable: bool = Field(True, alias="L1_SCALEIN_ENABLE")
@@ -377,43 +367,6 @@ def order_close_pair(sym: str):
     except Exception as e:
         print("order_close_pair error:", e)
 
-
-def minutes_to_next_payout() -> int:
-    t = now()
-    windows = (0, 8, 16)
-    nxt = None
-    for i in range(24):
-        c = (t + dt.timedelta(hours=i)).replace(minute=0, second=0, microsecond=0)
-        if c.hour in windows and c > t:
-            nxt = c
-            break
-    if nxt is None:
-        nxt = (t + dt.timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-    return max(0, int((nxt - t).total_seconds() // 60))
-
-def minutes_since_prev_payout() -> int:
-    t = now()
-    windows = (0, 8, 16)
-    prev = None
-    for i in range(24):
-        c = (t - dt.timedelta(hours=i)).replace(minute=0, second=0, microsecond=0)
-        if c.hour in windows and c < t:
-            prev = c
-            break
-    if prev is None:
-        prev = (t - dt.timedelta(days=1)).replace(hour=16, minute=0, second=0, microsecond=0)
-    return max(0, int((t - prev).total_seconds() // 60))
-
-def in_snipe_open_window() -> bool:
-    if not cfg.snipe_enable:
-        return True
-    return 0 < minutes_to_next_payout() <= max(1, cfg.snipe_window_min)
-
-def in_snipe_close_window() -> bool:
-    if not cfg.snipe_enable:
-        return False
-    return 0 <= minutes_since_prev_payout() <= max(1, cfg.snipe_close_after_min)
-
 # ---------- Время суток, динамический порог, отчёты ----------
 
 def min_quote_required(sym: str) -> float:
@@ -658,7 +611,7 @@ def main():
                     (not hedged)
                     and (fr >= (dyn_thr + cfg.fr_extra_buffer))
                     and (free >= max(effective_alloc, cfg.min_free))
-                    and (not in_funding_quiet_period()) and (not cfg.snipe_enable or (in_snipe_open_window() and fr >= cfg.snipe_min_fr))
+                    and (not in_funding_quiet_period())
                     and (spr <= cfg.max_spread_pct)
                     and (total_after <= total_cap)
                 )
@@ -670,7 +623,7 @@ def main():
                     dbg = {
                         "fr_ok": fr >= (dyn_thr + cfg.fr_extra_buffer),
                         "free_ok": free >= max(effective_alloc, cfg.min_free),
-                        "not_quiet": not in_funding_quiet_period(), "snipe_ok": (not cfg.snipe_enable or (in_snipe_open_window() and fr >= cfg.snipe_min_fr)),
+                        "not_quiet": not in_funding_quiet_period(),
                         "spread_ok": spr <= cfg.max_spread_pct,
                         "cap_ok": total_after <= total_cap,
                         "not_hedged": not hedged,
@@ -745,7 +698,7 @@ def main():
                     ots = int(sfloat(sget(con, f"open_ts:{sym}", "0"), 0.0))
                     if ots > 0:
                         held_min = max(0, int((now_ts - ots) // 60))
-                        exit_due_to_time = (held_min >= cfg.max_hold_min) and (fr < dyn_thr) or (cfg.snipe_enable and in_snipe_close_window())
+                        exit_due_to_time = (held_min >= cfg.max_hold_min) and (fr < dyn_thr)
 
                 if exit_due_to_negative or exit_due_to_below or exit_due_to_time:
                     try:
@@ -778,7 +731,7 @@ def main():
                         can_scale = (
                             fr >= (dyn_thr + max(0.0, cfg.scale_in_fr_buffer))
                             and spr <= cfg.max_spread_pct
-                            and (not in_funding_quiet_period()) and (not cfg.snipe_enable or (in_snipe_open_window() and fr >= cfg.snipe_min_fr))
+                            and (not in_funding_quiet_period())
                         )
                         if can_scale:
                             # размер доливки: минимум из scale_in_min_quote и доступного free, но не превышаем cap

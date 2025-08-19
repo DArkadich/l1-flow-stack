@@ -60,6 +60,8 @@ class Cfg(BaseModel):
     # Telegram
     tg_token: str = Field(..., alias="TG_BOT_TOKEN")
     tg_chat: str = Field(..., alias="TG_CHAT_ID")
+    # Отключать уведомления ночью (вне дневного окна)
+    tg_night_mute: bool = Field(True, alias="TG_NIGHT_MUTE")
 
     # Динамический порог + дневные отчёты
     dyn_hook: bool = Field(False, alias="L1_DYN_HOOK_ENABLE")
@@ -114,8 +116,14 @@ cfg = Cfg(**os.environ)
 # ---------- Telegram ----------
 bot = Bot(token=cfg.tg_token)
 
-def tg(msg: str):
+def tg(msg: str, force: bool = False):
+    """Отправка сообщения в TG. Ночные уведомления глушим, кроме критических.
+    Критичными считаем сообщения, начинающиеся с ❗️ или ⛔️.
+    """
     try:
+        is_critical = str(msg).startswith("❗️") or str(msg).startswith("⛔️")
+        if cfg.tg_night_mute and (not is_daytime()) and (not force) and (not is_critical):
+            return
         bot.send_message(chat_id=cfg.tg_chat, text=msg[:4000], disable_web_page_preview=True)
     except Exception as e:
         print("TG error:", e)
@@ -470,6 +478,16 @@ def is_daytime() -> bool:
     h = local_hour_24()
     return cfg.day_start_h <= h < cfg.day_end_h
 
+def should_send_9am_assets_report(tag_prev: str) -> bool:
+    """Ежедневный отчёт активов в 09:00 локального времени, ровно один раз.
+    tag_prev имеет формат YYYY-MM-DD_09.
+    """
+    dt_loc = local_datetime()
+    tag_now = dt_loc.strftime("%Y-%m-%d_%H")
+    if dt_loc.hour == 9 and tag_now != tag_prev:
+        return True
+    return False
+
 def minutes_to_next_funding_window() -> int:
     """ Funding выплата на 00:00, 08:00, 16:00 UTC. Считаем минуты до ближайшего окна. """
     t = now()
@@ -575,6 +593,7 @@ def main():
     last_equity = total_equity()
 
     last_report_tag = sget(con, "last_report_tag", "")  # YYYY-MM-DD_HH (локально)
+    last_assets_report_tag = sget(con, "last_assets_report_tag", "")
 
     while True:
         try:
@@ -809,6 +828,18 @@ def main():
                                 except Exception as e:
                                     print("scale_in error:", e)
                                     tg(f"⚠️ Не удалось долить {sym}: {e}")
+
+            # ------- ЕЖЕДНЕВНЫЙ ОТЧЁТ АКТИВОВ В 09:00 ЛОКАЛЬНО -------
+            if should_send_9am_assets_report(last_assets_report_tag):
+                last_assets_report_tag = local_datetime().strftime("%Y-%m-%d_%H")
+                sset(con, "last_assets_report_tag", last_assets_report_tag)
+                try:
+                    b = ex.fetch_balance(params={"type": "unified"}) or {}
+                    total = sfloat((b.get("total") or {}).get("USDT"), 0.0)
+                    free_b = sfloat((b.get("free") or {}).get("USDT"), 0.0)
+                    tg(f"📊 Ежедневный отчёт (09:00): общий баланс≈{total:.2f} USDT, свободно≈{free_b:.2f} USDT", force=True)
+                except Exception as e:
+                    print("assets_report error:", e)
 
             # ------- Часовой отчёт по funding только в дневные часы -------
             if is_daytime():

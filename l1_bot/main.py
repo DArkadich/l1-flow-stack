@@ -239,7 +239,36 @@ def fetch_balance_safe() -> Dict[str, Dict[str, float]]:
         return {"total": {}, "free": {}, "used": {}}
 
 
+def account_total_equity_usdt() -> float:
+    """Возвращает общий equity аккаунта (Unified) в USDT по v5 wallet-balance.
+    Это корректный источник для суммарного эквити, включая спот и деривативы.
+    """
+    try:
+        acct = (cfg.acct or "UNIFIED").upper()
+        wb = ex.private_get_v5_account_wallet_balance({"accountType": acct}) or {}
+        res = (wb.get("result") or {})
+        lst = res.get("list") or []
+        if not lst:
+            return 0.0
+        acc = lst[0] or {}
+        # Bybit v5: totalEquity — строка
+        te = sfloat(acc.get("totalEquity"), 0.0)
+        if te <= 0.0:
+            # Фоллбэк — попробуем accountIM или walletBalance суммарно
+            te = sfloat(acc.get("walletBalance"), 0.0)
+        return max(0.0, te)
+    except Exception as e:
+        if TRACE_API:
+            dlog(f"[account_total_equity_usdt] error: {e}")
+        return 0.0
+
+
 def total_equity() -> float:
+    # Пытаемся получить точное общее equity из v5 wallet-balance
+    te = account_total_equity_usdt()
+    if te > 0.0:
+        return te
+    # Фоллбэк: только USDT-остаток (может занижать при наличии альт-активов)
     bal = fetch_balance_safe()
     return sfloat(bal["total"].get("USDT"), 0.0)
 

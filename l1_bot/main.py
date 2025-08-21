@@ -90,6 +90,8 @@ class Cfg(BaseModel):
 
     max_total_alloc: float = Field(0.6, alias="L1_MAX_TOTAL_ALLOC_PCT")
     max_pair_alloc_pct: float = Field(0.20, alias="L1_MAX_PAIR_ALLOC_PCT")  # 20% max per pair - увеличен для лучшей маржинальности
+    # Принудительное закрытие через N часов удержания (0=выкл)
+    force_close_after_h: int = Field(0, alias="L1_FORCE_CLOSE_AFTER_HOURS")
     # Maker-first (postOnly) с тайм-аутом fallback на market
     maker_fallback_ms: int = Field(3000, alias="L1_MAKER_FALLBACK_MS")
 
@@ -628,6 +630,7 @@ def main():
             dyn_thr = current_fr_threshold(list(fr_map.values()))
 
             per_pair_alloc = max(0.0, eq * cfg.max_alloc)
+            cap_per_pair = max(0.0, eq * max(0.0, min(cfg.max_pair_alloc_pct, 0.99)))
             for sym in cfg.symbols:
                 perp = to_perp_symbol(sym)
                 fr = fr_map[sym]
@@ -644,15 +647,12 @@ def main():
                 msg = f"[{sym} | perp={perp}] FR(8h)={fr:.6f} (thr={dyn_thr:.6f}) px={px:.2f} hedged={hedged}"
 
                 # динамическое масштабирование аллокации при высоком FR
-                scaled_alloc = per_pair_alloc
+                scaled_alloc = min(per_pair_alloc, cap_per_pair)
                 if cfg.alloc_scale_enable and dyn_thr > 0:
                     excess = max(0.0, fr - dyn_thr)
                     scale = 1.0 + cfg.alloc_scale_k * (excess / max(dyn_thr, 1e-9))
                     scale = max(1.0, min(scale, cfg.alloc_scale_cap))
-                # ограничение размера позиции на пару (максимум 8% от капитала)
-                    max_pair_alloc = eq * cfg.max_alloc
-                    scaled_alloc = min(scaled_alloc, max_pair_alloc)
-                    scaled_alloc = per_pair_alloc * scale
+                    scaled_alloc = min(per_pair_alloc * scale, cap_per_pair)
 
                 # учёт минимального размера ордера спота/перпа (в USDT)
                 min_quote = min_quote_required(sym)
@@ -661,7 +661,11 @@ def main():
                 if min_quote > 0 and min_quote > eq * 0.8:
                     dlog(f"{now_s()} [{sym}] min_quote≈{min_quote:.2f} USDT > 80% equity≈{eq:.2f}, skip")
                     continue
+                # учтём текущую стоимость уже купленного спота, чтобы не превысить cap на пару
+                current_spot_quote = max(0.0, pos["spot"] * px)
+                remaining_cap_for_pair = max(0.0, cap_per_pair - current_spot_quote)
                 effective_alloc = max(scaled_alloc, min_quote)
+                effective_alloc = min(effective_alloc, remaining_cap_for_pair) if remaining_cap_for_pair > 0 else 0.0
 
                 # доп. фильтры: спред, FR-буфер, совокупная аллокация
                 spr = spread_pct(sym)
@@ -705,7 +709,7 @@ def main():
                     }
                     print(f"{now_s()} [ENTER_CHECK] {sym} {dbg}")
 
-                if can_enter and not is_marked_open(con, sym) and not_in_cooldown:
+                if can_enter and not is_marked_open(con, sym) and not_in_cooldown and effective_alloc >= min_quote:
                     try:
                         mark_open(con, sym, True)
                         # 1) сначала открываем перп-шорт, чтобы не съесть USDT под маржу покупкой спота
@@ -765,6 +769,9 @@ def main():
                     if ots > 0:
                         held_min = max(0, int((now_ts - ots) // 60))
                         exit_due_to_time = (held_min >= cfg.max_hold_min) and (fr < dyn_thr) or (cfg.snipe_enable and in_snipe_close_window())
+                        # принудительное закрытие после N часов независимо от FR
+                        if cfg.force_close_after_h > 0 and held_min >= max(1, cfg.force_close_after_h) * 60:
+                            exit_due_to_time = True
 
                 if exit_due_to_negative or exit_due_to_below or exit_due_to_time:
                     try:
@@ -801,7 +808,10 @@ def main():
                         )
                         if can_scale:
                             # размер доливки: минимум из scale_in_min_quote и доступного free, но не превышаем cap
-                            alloc_si = min(cfg.scale_in_min_quote, free)
+                            # не превышаем лимит на пару с учётом текущего спота
+                            current_spot_quote = max(0.0, positions(sym)["spot"] * px)
+                            remaining_cap_for_pair = max(0.0, cap_per_pair - current_spot_quote)
+                            alloc_si = min(cfg.scale_in_min_quote, free, remaining_cap_for_pair)
                             total_after_si = total_used_approx + alloc_si
                             if alloc_si >= cfg.scale_in_min_quote and total_after_si <= total_cap:
                                 try:
@@ -834,9 +844,8 @@ def main():
                 last_assets_report_tag = local_datetime().strftime("%Y-%m-%d_%H")
                 sset(con, "last_assets_report_tag", last_assets_report_tag)
                 try:
-                    b = ex.fetch_balance(params={"type": "unified"}) or {}
-                    total = sfloat((b.get("total") or {}).get("USDT"), 0.0)
-                    free_b = sfloat((b.get("free") or {}).get("USDT"), 0.0)
+                    total = total_equity()
+                    free_b = free_equity()
                     tg(f"📊 Ежедневный отчёт (09:00): общий баланс≈{total:.2f} USDT, свободно≈{free_b:.2f} USDT", force=True)
                 except Exception as e:
                     print("assets_report error:", e)

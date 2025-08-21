@@ -846,7 +846,18 @@ def main():
                 try:
                     total = total_equity()
                     free_b = free_equity()
-                    tg(f"📊 Ежедневный отчёт (09:00): общий баланс≈{total:.2f} USDT, свободно≈{free_b:.2f} USDT", force=True)
+                    day_start_equity = sfloat(sget(con, "day_start_equity", "0"), 0.0)
+                    pnl_today = total - day_start_equity if day_start_equity > 0 else 0.0
+                    pnl_today_pct = (pnl_today / day_start_equity * 100.0) if day_start_equity > 0 else 0.0
+                    start_base_cfg = sfloat(sget(con, "L1_START_BASE_USDT", str(cfg.start_base)), cfg.start_base)
+                    pnl_cum = total - start_base_cfg
+                    pnl_cum_pct = (pnl_cum / start_base_cfg * 100.0) if start_base_cfg > 0 else 0.0
+                    tg(
+                        f"📊 Ежедневный отчёт (09:00): equity≈{total:.2f} USDT (free≈{free_b:.2f}). "
+                        f"PnL сегодня≈{pnl_today:+.2f} USDT ({pnl_today_pct:+.2f}%). "
+                        f"PnL с запуска≈{pnl_cum:+.2f} USDT ({pnl_cum_pct:+.2f}%)",
+                        force=True,
+                    )
                 except Exception as e:
                     print("assets_report error:", e)
 

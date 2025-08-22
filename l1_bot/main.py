@@ -94,6 +94,8 @@ class Cfg(BaseModel):
     force_close_after_h: int = Field(0, alias="L1_FORCE_CLOSE_AFTER_HOURS")
     # Порог отсечения «пыли»: пока объём позиции в USDT меньше порога — не считаем пару хеджированной
     dust_usd_thr: float = Field(1.0, alias="L1_DUST_USD_THRESHOLD")
+    # Порядок открытия связки: PERP_FIRST или SPOT_FIRST
+    open_order: str = Field("SPOT_FIRST", alias="L1_OPEN_ORDER")
     # Maker-first (postOnly) с тайм-аутом fallback на market
     maker_fallback_ms: int = Field(3000, alias="L1_MAKER_FALLBACK_MS")
 
@@ -744,27 +746,43 @@ def main():
                 if can_enter and not is_marked_open(con, sym) and not_in_cooldown and effective_alloc >= min_quote:
                     try:
                         mark_open(con, sym, True)
-                        # 1) сначала открываем перп-шорт, чтобы не съесть USDT под маржу покупкой спота
                         px_enter = px
                         base = round_amount(sym, (effective_alloc / px_enter) * 0.998)
-                        try:
-                            _ = order_perp_sell(sym, base)
-                        except Exception as e:
-                            mark_open(con, sym, False)
-                            raise e
-
-                        # 2) затем покупаем спот тем же количеством базовой валюты
-                        try:
-                            _ = ex.create_order(sym, type="market", side="buy", amount=base)
-                        except Exception as e:
-                            # откатываем перп при неуспехе спота
+                        order = (cfg.open_order or "SPOT_FIRST").upper()
+                        if order == "SPOT_FIRST":
+                            # 1) сначала покупаем спот
                             try:
-                                perp = to_perp_symbol(sym)
-                                _ = ex.create_order(perp, type="market", side="buy", amount=base, params={"reduceOnly": True})
-                            except Exception as e2:
-                                print("compensation close perp failed:", e2)
-                            mark_open(con, sym, False)
-                            raise e
+                                _ = ex.create_order(sym, type="market", side="buy", amount=base)
+                            except Exception as e:
+                                mark_open(con, sym, False)
+                                raise e
+                            # 2) затем открываем перп шорт на ту же базу; при неуспехе — откатываем спот
+                            try:
+                                _ = order_perp_sell(sym, base)
+                            except Exception as e:
+                                try:
+                                    _ = ex.create_order(sym, type="market", side="sell", amount=base)
+                                except Exception as e2:
+                                    print("compensation sell spot failed:", e2)
+                                mark_open(con, sym, False)
+                                raise e
+                        else:
+                            # PERP_FIRST (старое поведение)
+                            try:
+                                _ = order_perp_sell(sym, base)
+                            except Exception as e:
+                                mark_open(con, sym, False)
+                                raise e
+                            try:
+                                _ = ex.create_order(sym, type="market", side="buy", amount=base)
+                            except Exception as e:
+                                try:
+                                    perp = to_perp_symbol(sym)
+                                    _ = ex.create_order(perp, type="market", side="buy", amount=base, params={"reduceOnly": True})
+                                except Exception as e2:
+                                    print("compensation close perp failed:", e2)
+                                mark_open(con, sym, False)
+                                raise e
                         # отметка времени открытия
                         sset(con, f"open_ts:{sym}", str(now_ts))
                         con.execute(

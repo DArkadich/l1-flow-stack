@@ -538,30 +538,25 @@ def minutes_to_next_funding_window() -> int:
 
 
 def current_fr_threshold(fr_values: List[float]) -> float:
-    """Динамический порог с устойчивостью к «плоскому» рынку.
-    Если межквартильный размах мал, используем base; иначе — low/base/high.
+    """Динамический порог: простая и устойчивая логика вокруг базового порога.
+    - low, если медиана < 0.75 * base
+    - high, если медиана > 1.5 * base
+    - иначе base
     """
     if not cfg.dyn_hook or not fr_values:
         return cfg.fr_thr
     try:
-        qs = statistics.quantiles(fr_values, n=4, method='inclusive')  # [Q1, Q2, Q3]
-        q1, q2, q3 = qs[0], qs[1], qs[2]
-        med = q2
-        iqr = max(0.0, q3 - q1)
-        low, base, high = cfg.fr_lower, cfg.fr_thr, cfg.fr_upper
-        # если рынок «плоский» – держим базовый порог
-        if iqr <= max(1e-6, base * 0.25):
-            return base
-        # иначе переключаемся в зоны
-        if med <= q1:
-            return low
-        if med >= q3:
-            return high
-        return base
-    except Exception:
         med = statistics.median(fr_values)
         low, base, high = cfg.fr_lower, cfg.fr_thr, cfg.fr_upper
-        return base if abs(med - base) <= max(1e-6, base * 0.25) else (low if med < base else high)
+        low_border = base * 0.75
+        high_border = base * 1.50
+        if med <= low_border:
+            return low
+        if med >= high_border:
+            return min(high, max(base, med))
+        return base
+    except Exception:
+        return cfg.fr_thr
 
 
 def in_funding_window() -> bool:

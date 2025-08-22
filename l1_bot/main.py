@@ -92,6 +92,8 @@ class Cfg(BaseModel):
     max_pair_alloc_pct: float = Field(0.20, alias="L1_MAX_PAIR_ALLOC_PCT")  # 20% max per pair - увеличен для лучшей маржинальности
     # Принудительное закрытие через N часов удержания (0=выкл)
     force_close_after_h: int = Field(0, alias="L1_FORCE_CLOSE_AFTER_HOURS")
+    # Порог отсечения «пыли»: пока объём позиции в USDT меньше порога — не считаем пару хеджированной
+    dust_usd_thr: float = Field(1.0, alias="L1_DUST_USD_THRESHOLD")
     # Maker-first (postOnly) с тайм-аутом fallback на market
     maker_fallback_ms: int = Field(3000, alias="L1_MAKER_FALLBACK_MS")
 
@@ -669,7 +671,11 @@ def main():
                     continue
 
                 pos = positions(sym)
-                hedged = (pos["spot"] > 1e-6) and (pos["perp"] < -1e-6) and (abs(pos["perp"]) >= pos["spot"] * 0.95)
+                # считаем хеджированной только если объёмы больше «пыли» в USDT
+                spot_usd = pos["spot"] * px
+                perp_usd = abs(pos["perp"]) * px
+                significant = (spot_usd >= cfg.dust_usd_thr) and (perp_usd >= cfg.dust_usd_thr)
+                hedged = significant and (pos["spot"] > 1e-6) and (pos["perp"] < -1e-6) and (abs(pos["perp"]) >= pos["spot"] * 0.95)
                 if is_marked_open(con, sym) and not hedged:
                     # пометка устарела — очищаем
                     mark_open(con, sym, False)

@@ -96,6 +96,12 @@ class Cfg(BaseModel):
     dust_usd_thr: float = Field(1.0, alias="L1_DUST_USD_THRESHOLD")
     # Порядок открытия связки: PERP_FIRST или SPOT_FIRST
     open_order: str = Field("SPOT_FIRST", alias="L1_OPEN_ORDER")
+    # Трейлинг по пику FR (доля отката, 0=выкл)
+    trail_fr_pct: float = Field(0.0, alias="L1_TRAIL_FR_PCT")
+    # Минимум доступной маржи (USDT) для авто-редьюса
+    margin_min_usdt: float = Field(10.0, alias="L1_MARGIN_MIN_USDT")
+    auto_reduce_fraction: float = Field(0.5, alias="L1_AUTO_REDUCE_FRACTION")
+    auto_reduce_cooldown_sec: int = Field(300, alias="L1_AUTO_REDUCE_COOLDOWN_SEC")
     # Maker-first (postOnly) с тайм-аутом fallback на market
     maker_fallback_ms: int = Field(3000, alias="L1_MAKER_FALLBACK_MS")
 
@@ -104,6 +110,7 @@ class Cfg(BaseModel):
     snipe_window_min: int = Field(12, alias="L1_SNIPE_WINDOW_MIN")
     snipe_min_fr: float = Field(0.00020, alias="L1_SNIPE_MIN_FR")
     snipe_close_after_min: int = Field(3, alias="L1_SNIPE_CLOSE_AFTER_MIN")
+    snipe_top_n: int = Field(3, alias="L1_SNIPE_TOP_N")
 
 
     # Доливка (scale-in) в уже открытые связки
@@ -264,6 +271,31 @@ def account_total_equity_usdt() -> float:
     except Exception as e:
         if TRACE_API:
             dlog(f"[account_total_equity_usdt] error: {e}")
+        return 0.0
+
+
+def available_balance_usdt() -> float:
+    """Доступная маржа в USDT из v5 wallet-balance (Unified)."""
+    try:
+        acct = (cfg.acct or "UNIFIED").upper()
+        wb = ex.private_get_v5_account_wallet_balance({"accountType": acct}) or {}
+        acc = ((wb.get("result") or {}).get("list") or [{}])[0]
+        for c in acc.get("coin", []) or []:
+            if (c.get("coin") or "").upper() == "USDT":
+                ab = sfloat(c.get("availableBalance"), 0.0)
+                if ab <= 0.0:
+                    ab = sfloat(c.get("availableToWithdraw"), 0.0)
+                if ab <= 0.0:
+                    # fallback: walletBalance - IM
+                    wbv = sfloat(c.get("walletBalance"), 0.0)
+                    im_ord = sfloat(c.get("totalOrderIM"), 0.0)
+                    im_pos = sfloat(c.get("totalPositionIM"), 0.0)
+                    ab = max(0.0, wbv - (im_ord + im_pos))
+                return max(0.0, ab)
+        return 0.0
+    except Exception as e:
+        if TRACE_API:
+            dlog(f"[available_balance_usdt] error: {e}")
         return 0.0
 
 
@@ -654,14 +686,34 @@ def main():
             # ------- FR по всем парам + dyn threshold -------
             fr_map: Dict[str, float] = {}
             px_map: Dict[str, float] = {}
+            # предфильтр символов: только имеющие swap
+            valid_symbols = []
             for sym in cfg.symbols:
+                perp_sym = f"{sym}:USDT"
+                if perp_sym in ex.markets and ex.markets[perp_sym].get("swap"):
+                    valid_symbols.append(sym)
+                else:
+                    dlog(f"{now_s()} [SKIP] {sym} no linear swap")
+
+            for sym in valid_symbols:
                 fr_map[sym] = funding_8h(sym)
                 px_map[sym] = mark(sym)
             dyn_thr = current_fr_threshold(list(fr_map.values()))
 
             per_pair_alloc = max(0.0, eq * cfg.max_alloc)
             cap_per_pair = max(0.0, eq * max(0.0, min(cfg.max_pair_alloc_pct, 0.99)))
-            for sym in cfg.symbols:
+            # snipe: отранжировать пары по FR/моментуму и ограничить топ-N
+            symbols_order = valid_symbols
+            if cfg.snipe_enable:
+                # моментум FR: разница между текущим FR и порогом dyn_thr
+                ranked = sorted(
+                    [(sym, fr_map.get(sym, 0.0)) for sym in valid_symbols],
+                    key=lambda kv: kv[1], reverse=True,
+                )
+                top_n = max(1, sfloat(cfg.snipe_top_n, 3))
+                symbols_order = [s for s, _ in ranked[:int(top_n)]]
+
+            for sym in symbols_order:
                 perp = to_perp_symbol(sym)
                 fr = fr_map[sym]
                 px = px_map[sym]
@@ -698,7 +750,12 @@ def main():
                 # учтём текущую стоимость уже купленного спота, чтобы не превысить cap на пару
                 current_spot_quote = max(0.0, pos["spot"] * px)
                 remaining_cap_for_pair = max(0.0, cap_per_pair - current_spot_quote)
+                # адаптация под доступную маржу: не превышать availableBalance, оставляя 10% запас
+                avail = available_balance_usdt()
+                headroom = max(0.0, avail * 0.90)
                 effective_alloc = max(scaled_alloc, min_quote)
+                if headroom > 0:
+                    effective_alloc = min(effective_alloc, headroom)
                 effective_alloc = min(effective_alloc, remaining_cap_for_pair) if remaining_cap_for_pair > 0 else 0.0
 
                 # доп. фильтры: спред, FR-буфер, совокупная аллокация
@@ -822,6 +879,15 @@ def main():
                         # принудительное закрытие после N часов независимо от FR
                         if cfg.force_close_after_h > 0 and held_min >= max(1, cfg.force_close_after_h) * 60:
                             exit_due_to_time = True
+                        # трейлинг по пику FR: запоминаем максимум и закрываем при откате
+                        if cfg.trail_fr_pct > 0 and hedged:
+                            key_peak = f"fr_peak:{sym}"
+                            peak = sfloat(sget(con, key_peak, "0"), 0.0)
+                            if fr > peak:
+                                sset(con, key_peak, fr)
+                            elif peak > 0:
+                                if fr <= peak * max(0.0, 1.0 - cfg.trail_fr_pct):
+                                    exit_due_to_time = True
 
                 if exit_due_to_negative or exit_due_to_below or exit_due_to_time:
                     try:
@@ -888,6 +954,29 @@ def main():
                                 except Exception as e:
                                     print("scale_in error:", e)
                                     tg(f"⚠️ Не удалось долить {sym}: {e}")
+
+            # ------- АВТО-REDUCE ПРИ НИЗКОЙ МАРЖЕ -------
+            try:
+                if cfg.margin_min_usdt > 0:
+                    avail = available_balance_usdt()
+                    last_reduce_ts = int(sfloat(sget(con, "auto_reduce_last_ts", "0"), 0.0))
+                    if avail < cfg.margin_min_usdt and (now_ts - last_reduce_ts) >= max(0, cfg.auto_reduce_cooldown_sec):
+                        # пробуем частично сжать все открытые пары
+                        for sym in valid_symbols:
+                            pos = positions(sym)
+                            if pos["spot"] > 1e-6 and abs(pos["perp"]) > 1e-6:
+                                try:
+                                    base_reduce = max(0.0, min(pos["spot"], abs(pos["perp"])) * cfg.auto_reduce_fraction)
+                                    if base_reduce > 0:
+                                        perp = to_perp_symbol(sym)
+                                        _ = ex.create_order(perp, type="market", side=("buy" if pos["perp"]<0 else "sell"), amount=base_reduce, params={"reduceOnly": True})
+                                        _ = ex.create_order(sym, type="market", side="sell", amount=base_reduce)
+                                        tg(f"🔧 Auto-reduce {sym} на {base_reduce:.6f} base из-за низкой маржи ({avail:.2f} USDT)")
+                                except Exception as e:
+                                    dlog(f"auto-reduce error {sym}: {e}")
+                        sset(con, "auto_reduce_last_ts", str(now_ts))
+            except Exception as e:
+                dlog(f"auto-reduce block error: {e}")
 
             # ------- ЕЖЕДНЕВНЫЙ ОТЧЁТ АКТИВОВ В 09:00 ЛОКАЛЬНО -------
             if should_send_9am_assets_report(last_assets_report_tag):

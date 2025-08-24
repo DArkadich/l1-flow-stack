@@ -804,7 +804,16 @@ def main():
                     try:
                         mark_open(con, sym, True)
                         px_enter = px
-                        base = round_amount(sym, (effective_alloc / px_enter) * 0.998)
+                        # освежим доступную маржу прямо перед входом и добавим запас на комиссии/скрытые залоки
+                        avail_now = available_balance_usdt()
+                        # оставим ~12% буфера и фикс. 0.25 USDT на комиссии/округления
+                        quote_max = max(0.0, avail_now * 0.88 - 0.25)
+                        quote_use = min(effective_alloc, quote_max)
+                        if quote_use < max(0.0, min_quote):
+                            mark_open(con, sym, False)
+                            raise RuntimeError(f"headroom {quote_max:.2f} < min_quote {min_quote:.2f}")
+                        # дополнительный -0.4% запас на комиссию и слиппедж
+                        base = round_amount(sym, (quote_use / px_enter) * 0.996)
                         order = (cfg.open_order or "SPOT_FIRST").upper()
                         if order == "SPOT_FIRST":
                             # 1) сначала покупаем спот

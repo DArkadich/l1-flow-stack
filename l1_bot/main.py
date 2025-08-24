@@ -3,6 +3,28 @@ from typing import List, Dict, Any
 import statistics
 import time
 
+"""
+L1 Bot - Адаптивная система арбитража спот/перп с умным управлением маржой
+
+ВНЕСЁННЫЕ ИЗМЕНЕНИЯ:
+1. АДАПТИВНАЯ АЛЛОКАЦИЯ: размер позиции автоматически подстраивается под доступную маржу
+   - avail >= 20: до 50% доступной маржи (агрессивное использование)
+   - avail >= 12: до 75% доступной маржи (рост доходности)
+   - avail >= 6: до 85% доступной маржи (максимизация)
+   - avail >= 3: до 90% доступной маржи (минимальная маржа)
+   - avail < 3: вход невозможен
+
+2. PERP_FIRST по умолчанию: экономия маржи, меньше ошибок "Insufficient balance"
+
+3. УЛУЧШЕННЫЕ ПРОВЕРКИ МАРЖИ: учёт availableBalance + free + лимиты
+
+4. СТАБИЛИЗАЦИЯ КАПА: буфер 15% вместо 1% для предотвращения резких колебаний
+
+5. УМНОЕ РАСПРЕДЕЛЕНИЕ: не тратит всю маржу в одну пару, не простаивает при избытке
+
+ЦЕЛЬ: повышение дневной маржинальности с 0.15% до 0.5% (рост в 3.3 раза)
+"""
+
 import ccxt
 from pydantic import BaseModel, Field, field_validator
 from telegram import Bot
@@ -714,11 +736,11 @@ def main():
                 symbols_order = [s for s, _ in ranked[:int(top_n)]]
 
             for sym in symbols_order:
-                perp = to_perp_symbol(sym)
+                perp_sym = to_perp_symbol(sym)
                 fr = fr_map[sym]
                 px = px_map[sym]
                 if px <= 0:
-                    dlog(f"{now_s()} [{sym}] perp={perp} mark price unavailable, skip")
+                    dlog(f"{now_s()} [{sym}] perp={perp_sym} mark price unavailable, skip")
                     continue
 
                 pos = positions(sym)
@@ -730,7 +752,7 @@ def main():
                 if is_marked_open(con, sym) and not hedged:
                     # пометка устарела — очищаем
                     mark_open(con, sym, False)
-                msg = f"[{sym} | perp={perp}] FR(8h)={fr:.6f} (thr={dyn_thr:.6f}) px={px:.2f} hedged={hedged}"
+                msg = f"[{sym} | perp={perp_sym}] FR(8h)={fr:.6f} (thr={dyn_thr:.6f}) px={px:.2f} hedged={hedged}"
 
                 # динамическое масштабирование аллокации при высоком FR
                 scaled_alloc = min(per_pair_alloc, cap_per_pair)
@@ -747,22 +769,53 @@ def main():
                 if min_quote > 0 and min_quote > eq * 0.8:
                     dlog(f"{now_s()} [{sym}] min_quote≈{min_quote:.2f} USDT > 80% equity≈{eq:.2f}, skip")
                     continue
+                
                 # учтём текущую стоимость уже купленного спота, чтобы не превысить cap на пару
                 current_spot_quote = max(0.0, pos["spot"] * px)
                 remaining_cap_for_pair = max(0.0, cap_per_pair - current_spot_quote)
-                # адаптация под доступную маржу: не превышать availableBalance, оставляя 10% запас
+                
+                # АДАПТИВНАЯ АЛЛОКАЦИЯ: умное использование доступной маржи
                 avail = available_balance_usdt()
-                headroom = max(0.0, avail * 0.90)
-                effective_alloc = max(scaled_alloc, min_quote)
-                if headroom > 0:
-                    effective_alloc = min(effective_alloc, headroom)
-                effective_alloc = min(effective_alloc, remaining_cap_for_pair) if remaining_cap_for_pair > 0 else 0.0
+                
+                # Базовый размер из конфига
+                base_alloc = max(scaled_alloc, min_quote)
+                
+                # ОПТИМИЗИРОВАННАЯ АЛЛОКАЦИЯ для повышения маржинальности до 0.5% в день
+                if avail >= 20.0:
+                    # Много маржи - агрессивное использование до 50% доступной
+                    eff_alloc = min(base_alloc, avail * 0.5)
+                elif avail >= 12.0:
+                    # Средняя маржа - до 75% доступной для роста доходности
+                    eff_alloc = min(base_alloc, avail * 0.75)
+                elif avail >= 6.0:
+                    # Мало маржи - до 85% доступной для максимизации
+                    eff_alloc = min(base_alloc, avail * 0.85)
+                elif avail >= 3.0:
+                    # Минимальная маржа - до 90% доступной
+                    eff_alloc = min(base_alloc, avail * 0.9)
+                else:
+                    # Недостаточно маржи - вход невозможен
+                    eff_alloc = 0.0
+                
+                # Дополнительные ограничения
+                if eff_alloc > 0:
+                    # Ограничение по лимиту на пару
+                    eff_alloc = min(eff_alloc, remaining_cap_for_pair) if remaining_cap_for_pair > 0 else 0.0
+                    # Ограничение по глобальному капу (стабилизация)
+                    total_used_approx = max(0.0, eq - free)
+                    total_after = total_used_approx + eff_alloc
+                    # Стабилизация капа: буфер 15% вместо 1%
+                    total_cap = eq * max(0.0, min(cfg.max_total_alloc, 0.85))
+                    if total_after > total_cap:
+                        eff_alloc = max(0.0, total_cap - total_used_approx)
+                        total_after = total_used_approx + eff_alloc
+                else:
+                    total_used_approx = max(0.0, eq - free)
+                    total_after = total_used_approx
+                    total_cap = eq * max(0.0, min(cfg.max_total_alloc, 0.85))
 
                 # доп. фильтры: спред, FR-буфер, совокупная аллокация
                 spr = spread_pct(sym)
-                total_used_approx = max(0.0, eq - free)  # приблизительно: занято = equity - free
-                total_after = total_used_approx + effective_alloc
-                total_cap = eq * max(0.0, min(cfg.max_total_alloc, 0.99))
 
                 # гистерезис удержания: снижение порога для проверки выхода (ниже)
                 hold_thr = max(0.0, dyn_thr - cfg.hysteresis_fr)
@@ -771,10 +824,12 @@ def main():
                 can_enter = (
                     (not hedged)
                     and (fr >= (dyn_thr + cfg.fr_extra_buffer))
-                    and (free >= max(effective_alloc, cfg.min_free))
+                    and (free >= max(eff_alloc, cfg.min_free))
                     and (not in_funding_quiet_period()) and (not cfg.snipe_enable or (in_snipe_open_window() and fr >= cfg.snipe_min_fr))
                     and (spr <= cfg.max_spread_pct)
                     and (total_after <= total_cap)
+                    and (eff_alloc >= min_quote)  # проверка минимального размера
+                    and (avail >= 4.0)  # минимальная доступная маржа
                 )
                 # cooldown
                 cd_until = int(sfloat(sget(con, f"cooldown_until:{sym}", "0"), 0.0))
@@ -783,15 +838,16 @@ def main():
                 if EXTRA_LOGS:
                     dbg = {
                         "fr_ok": fr >= (dyn_thr + cfg.fr_extra_buffer),
-                        "free_ok": free >= max(effective_alloc, cfg.min_free),
+                        "free_ok": free >= max(eff_alloc, cfg.min_free),
                         "not_quiet": not in_funding_quiet_period(), "snipe_ok": (not cfg.snipe_enable or (in_snipe_open_window() and fr >= cfg.snipe_min_fr)),
                         "spread_ok": spr <= cfg.max_spread_pct,
                         "cap_ok": total_after <= total_cap,
                         "not_hedged": not hedged,
                         "not_in_cooldown": not_in_cooldown,
                         "marked_open": is_marked_open(con, sym),
-                        "eff_alloc": round(effective_alloc, 4),
+                        "eff_alloc": round(eff_alloc, 4),
                         "free": round(free, 4),
+                        "avail": round(avail, 4),
                         "spr": round(spr, 6),
                         "dyn_thr": round(dyn_thr, 6),
                         "fr": round(fr, 6),
@@ -800,22 +856,38 @@ def main():
                     }
                     print(f"{now_s()} [ENTER_CHECK] {sym} {dbg}")
 
-                if can_enter and not is_marked_open(con, sym) and not_in_cooldown and effective_alloc >= min_quote:
+                if can_enter and not is_marked_open(con, sym) and not_in_cooldown:
                     try:
                         mark_open(con, sym, True)
                         px_enter = px
-                        # освежим доступную маржу прямо перед входом и добавим запас на комиссии/скрытые залоки
-                        avail_now = available_balance_usdt()
-                        # оставим ~12% буфера и фикс. 0.25 USDT на комиссии/округления
-                        quote_max = max(0.0, avail_now * 0.88 - 0.25)
-                        quote_use = min(effective_alloc, quote_max)
-                        if quote_use < max(0.0, min_quote):
-                            mark_open(con, sym, False)
-                            raise RuntimeError(f"headroom {quote_max:.2f} < min_quote {min_quote:.2f}")
-                        # дополнительный -0.4% запас на комиссию и слиппедж
-                        base = round_amount(sym, (quote_use / px_enter) * 0.996)
-                        order = (cfg.open_order or "SPOT_FIRST").upper()
-                        if order == "SPOT_FIRST":
+                        
+                        # PERP_FIRST по умолчанию для экономии маржи
+                        order = (cfg.open_order or "PERP_FIRST").upper()
+                        
+                        # Расчёт размера позиции с учётом адаптивной аллокации
+                        base = round_amount(sym, (eff_alloc / px_enter) * 0.998)
+                        
+                        if order == "PERP_FIRST":
+                            # 1) сначала открываем перп шорт (используем маржу)
+                            try:
+                                _ = order_perp_sell(sym, base)
+                            except Exception as e:
+                                mark_open(con, sym, False)
+                                raise e
+                            # 2) затем покупаем спот тем же количеством базовой валюты
+                            try:
+                                _ = ex.create_order(sym, type="market", side="buy", amount=base)
+                            except Exception as e:
+                                # откатываем перп при неуспехе спота
+                                try:
+                                    perp = to_perp_symbol(sym)
+                                    _ = ex.create_order(perp, type="market", side="buy", amount=base, params={"reduceOnly": True})
+                                except Exception as e2:
+                                    print("compensation close perp failed:", e2)
+                                mark_open(con, sym, False)
+                                raise e
+                        else:
+                            # SPOT_FIRST (если явно указан)
                             # 1) сначала покупаем спот
                             try:
                                 _ = ex.create_order(sym, type="market", side="buy", amount=base)
@@ -832,38 +904,21 @@ def main():
                                     print("compensation sell spot failed:", e2)
                                 mark_open(con, sym, False)
                                 raise e
-                        else:
-                            # PERP_FIRST (старое поведение)
-                            try:
-                                _ = order_perp_sell(sym, base)
-                            except Exception as e:
-                                mark_open(con, sym, False)
-                                raise e
-                            try:
-                                _ = ex.create_order(sym, type="market", side="buy", amount=base)
-                            except Exception as e:
-                                try:
-                                    perp = to_perp_symbol(sym)
-                                    _ = ex.create_order(perp, type="market", side="buy", amount=base, params={"reduceOnly": True})
-                                except Exception as e2:
-                                    print("compensation close perp failed:", e2)
-                                mark_open(con, sym, False)
-                                raise e
                         # отметка времени открытия
                         sset(con, f"open_ts:{sym}", str(now_ts))
                         con.execute(
                             "INSERT INTO trades(ts,sym,action,base,quote,info) VALUES(?,?,?,?,?,?)",
-                            (now_s(), sym, "open_pair", base, effective_alloc, f"fr={fr} min_quote={min_quote:.4f}")
+                            (now_s(), sym, "open_pair", base, eff_alloc, f"fr={fr} min_quote={min_quote:.4f}")
                         )
                         con.commit()
-                        tg(f"🟢 L1 OPEN {sym} (perp {perp}) • FR={fr:.5f} thr={dyn_thr:.5f} • alloc≈{effective_alloc:.2f} USDT")
+                        tg(f"🟢 L1 OPEN {sym} (perp {perp_sym}) • FR={fr:.5f} thr={dyn_thr:.5f} • alloc≈{eff_alloc:.2f} USDT")
                         time.sleep(2)
                         # сбрасываем пометку, чтобы не мешать повторным входам в будущем
                         mark_open(con, sym, False)
                         continue
                     except Exception as e:
                         print("open_pair error:", e)
-                        tg(f"⚠️ Не удалось открыть связку {sym} (perp {perp}): {e}")
+                        tg(f"⚠️ Не удалось открыть связку {sym} (perp {perp_sym}): {e}")
 
                 # выход по отрицательному funding
                 below_key = f"below_thr_count:{sym}"
@@ -906,7 +961,7 @@ def main():
                             (now_s(), sym, "close_pair", 0, 0, f"fr={fr}")
                         )
                         con.commit()
-                        tg(f"🔴 L1 CLOSE {sym} (perp {perp}) • FR={fr:.5f}")
+                        tg(f"🔴 L1 CLOSE {sym} (perp {perp_sym}) • FR={fr:.5f}")
                         # сброс счётчика и установка cooldown
                         sset(con, below_key, "0")
                         cd_until = now_ts + max(0, cfg.cooldown_min) * 60
@@ -915,7 +970,7 @@ def main():
                         continue
                     except Exception as e:
                         print("close_pair error:", e)
-                        tg(f"⚠️ Не удалось закрыть связку {sym} (perp {perp}): {e}")
+                        tg(f"⚠️ Не удалось закрыть связку {sym} (perp {perp_sym}): {e}")
 
                 print(f"{now_s()} {msg} OK")
 
